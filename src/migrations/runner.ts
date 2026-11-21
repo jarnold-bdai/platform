@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { assertMode, assertPhase, validateMigrations } from './id.js';
 import { isStale, type HistoryRecord, type HistoryStatus, type MigrationHistory } from './history.js';
+import { readOnlyDynamo } from './readOnlyClient.js';
 import { Report, SUMMARY_ENTRY_LIMIT, formatCounts } from './report.js';
 import {
   LeaseLostError,
@@ -251,7 +252,8 @@ function makeContext(
     migrationId: migration.id,
     phase: migration.phase,
     mode: options.mode,
-    dynamo: options.dynamo,
+    // In dry-run and check the migration gets a client that refuses every write.
+    dynamo: options.mode === 'write' ? options.dynamo : readOnlyDynamo(options.dynamo, options.mode),
     tableName: (logicalName) => {
       const name = options.resolveTable(logicalName);
       if (typeof name !== 'string' || name === '') throw new UsageError(`no table name for logical table ${logicalName}`);

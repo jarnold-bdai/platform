@@ -53,7 +53,7 @@ Rules for authors:
 - **Use `#name` placeholders** in every expression (update, condition, filter).
 - **Refuse, don't guess.** Return `refuse` with a reason for anything ambiguous or malformed. A refused item is never written and stops the run until someone resolves it.
 - Tables are logical names (`ctx.tableName('AiConfiguration')`); the consumer's resolver maps them to the real names in each environment.
-- A migration that doesn't fit the scan helper can use the context directly (`ctx.dynamo`, `ctx.mode`, `ctx.report`, `ctx.checkpoint`, `ctx.signal`). It must write nothing unless `ctx.mode === 'write'`, call `ctx.report.pending(item)` for each write it would make in dry run and check, and stop when `ctx.signal` aborts.
+- A migration that doesn't fit the scan helper can use the context directly (`ctx.dynamo`, `ctx.mode`, `ctx.report`, `ctx.checkpoint`, `ctx.signal`). It must call `ctx.report.pending(item)` for each write it would make in dry run and check, and stop when `ctx.signal` aborts. Read-only modes are enforced: in dry run and check, `ctx.dynamo` wraps the caller's client and refuses every command that could write (`PutItem`, `UpdateItem`, `DeleteItem`, `BatchWriteItem`, `TransactWriteItems`, PartiQL other than `SELECT`, table management, and any command it does not know) with a `ReadOnlyModeError` naming the mode and the command, which fails the migration. Reads (`GetItem`, `BatchGetItem`, `Query`, `Scan`, `TransactGetItems`, `Describe*`, `List*`, PartiQL `SELECT`) go through. A client built on it, such as `DynamoDBDocumentClient.from(ctx.dynamo)`, is guarded the same way. So check `ctx.mode` before writing; a write in a dry run is a bug the run reports, not a write.
 
 ## Phases: `pre` and `post`
 
@@ -70,9 +70,11 @@ The old code keeps writing while and after a `pre` migration runs, until the dep
 
 | flag        | mode      | data           | history                         |
 |-------------|-----------|----------------|---------------------------------|
-| (none)      | `dry-run` | read only      | read only                       |
+| (none)      | `dry-run` | read only (enforced) | read only                 |
 | `--write`   | `write`   | conditional writes | claims, checkpoints, records |
-| `--check`   | `check`   | read only      | read only                       |
+| `--check`   | `check`   | read only (enforced) | read only                 |
+
+In dry run and check the runner only lists the history (one `Scan`); it never claims, renews, checkpoints or records, and checkpoint saves stay in memory.
 
 The runner takes the registered migrations of the phase that are not `applied` in the history, in id order. It stops at the first one that fails, refuses an item, hits a conflict, or is held by another runner. The later ones are listed as `not-run`.
 

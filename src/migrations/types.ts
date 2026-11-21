@@ -63,7 +63,7 @@ export interface MigrationContext {
   readonly migrationId: string;
   readonly phase: Phase;
   readonly mode: Mode;
-  /** Passed in by the caller; the library never constructs a client. */
+  /** The caller's client (the library never constructs one); in `dry-run` and `check`, wrapped so that every write is refused. */
   readonly dynamo: DynamoDBClient;
   /** The real name of a logical table; throws a usage error when the consumer's resolver has none. */
   tableName(logicalName: string): string;
