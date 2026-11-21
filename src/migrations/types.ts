@@ -99,12 +99,25 @@ export interface MigrationReport {
   conflicts: ReportEntry[];
 }
 
-/** Thrown for a configuration or invocation mistake; the runner exits 2. */
+/** Thrown for a configuration or invocation mistake; the runner exits 2. Detect it with `isUsageError`. */
 export class UsageError extends Error {
   override name = 'UsageError';
 }
 
-/** Thrown when this runner no longer holds the claim on a migration. */
+/** Thrown when this runner no longer holds the claim on a migration. Detect it with `isLeaseLostError`. */
 export class LeaseLostError extends Error {
   override name = 'LeaseLostError';
 }
+
+// The package ships a CommonJS and an ESM build. When both are loaded in one
+// process (say, an ESM migration file run by a CommonJS CLI), each has its own
+// copy of every class, and `instanceof` fails across them. So the errors are
+// recognised by `name`, which both copies set.
+const hasName = (error: unknown, name: string): boolean =>
+  typeof error === 'object' && error !== null && (error as { name?: unknown }).name === name;
+
+/** True for a `UsageError` from either build of this package. */
+export const isUsageError = (error: unknown): boolean => hasName(error, 'UsageError');
+
+/** True for a `LeaseLostError` from either build of this package. */
+export const isLeaseLostError = (error: unknown): boolean => hasName(error, 'LeaseLostError');

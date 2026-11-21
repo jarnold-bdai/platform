@@ -4,6 +4,8 @@ export {
   PHASES,
   LeaseLostError,
   UsageError,
+  isLeaseLostError,
+  isUsageError,
   type CheckpointStore,
   type Item,
   type Logger,

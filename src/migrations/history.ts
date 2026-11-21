@@ -6,7 +6,7 @@ import {
   type DynamoDBClient,
 } from '@aws-sdk/client-dynamodb';
 import { convertToAttr, unmarshall } from '@aws-sdk/util-dynamodb';
-import { LeaseLostError, type Item, type MigrationReport, type Phase } from './types.js';
+import { LeaseLostError, isLeaseLostError, type Item, type MigrationReport, type Phase } from './types.js';
 
 export type HistoryStatus = 'running' | 'applied' | 'failed';
 
@@ -299,7 +299,7 @@ export class DynamoDbMigrationHistory implements MigrationHistory {
       }, RENEWABLE, signal);
       return true;
     } catch (error) {
-      if (error instanceof LeaseLostError) return false;
+      if (isLeaseLostError(error)) return false;
       throw error;
     }
   }

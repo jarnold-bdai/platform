@@ -7,6 +7,7 @@ import { Report, SUMMARY_ENTRY_LIMIT, formatCounts } from './report.js';
 import {
   LeaseLostError,
   UsageError,
+  isUsageError,
   type CheckpointStore,
   type Logger,
   type Migration,
@@ -129,7 +130,7 @@ export function errorText(error: unknown): string {
 }
 
 /** Exit 2 for a usage or AWS error, 1 for anything else a migration throws. */
-const isHardError = (error: unknown): boolean => error instanceof UsageError || isAwsError(error);
+const isHardError = (error: unknown): boolean => isUsageError(error) || isAwsError(error);
 
 export const consoleLogger: Logger = {
   info: (message) => console.log(message),
