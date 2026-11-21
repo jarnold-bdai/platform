@@ -59,6 +59,13 @@ export interface RunOptions {
   now?: () => Date;
   /** Identifies this runner in the history; default a random UUID. */
   runnerId?: string;
+  /**
+   * Aborted to stop the run early (the CLI aborts it on SIGINT/SIGTERM). The
+   * running migration's `ctx.signal` aborts, its attempt is recorded as
+   * `failed` (which releases the claim and keeps the checkpoint, so the next
+   * `--write` resumes), and the migrations after it are not run.
+   */
+  signal?: AbortSignal;
 }
 
 export type OutcomeStatus =
@@ -206,8 +213,8 @@ export async function runMigrations(options: RunOptions): Promise<RunResult> {
     let stopped = false;
     for (const migration of selected) {
       const base = { id: migration.id, phase: migration.phase, description: migration.description };
-      if (stopped) {
-        result.migrations.push({ ...base, status: 'not-run', message: 'an earlier migration stopped the run' });
+      if (stopped || options.signal?.aborted) {
+        result.migrations.push({ ...base, status: 'not-run', message: stopped ? 'an earlier migration stopped the run' : 'the run was interrupted' });
         continue;
       }
       const record = records.get(migration.id);
@@ -313,7 +320,8 @@ async function runReadOnly(
   };
   let error: unknown;
   try {
-    await migration.run(makeContext(migration, options, checkpoint, report, new AbortController().signal));
+    await migration.run(makeContext(migration, options, checkpoint, report, options.signal ?? new AbortController().signal));
+    if (options.signal?.aborted) error = options.signal.reason;
   } catch (caught) {
     error = caught ?? new Error('run threw an undefined value');
   }
@@ -434,6 +442,16 @@ async function runWrite(
       ended.signal.removeEventListener('abort', onEnded);
     }
   };
+  // An outside stop request (SIGINT/SIGTERM) aborts the migration like a lost
+  // lease does; the attempt then ends as `failed`, which releases the claim.
+  const onInterrupt = () => {
+    if (!controller.signal.aborted && !ended.signal.aborted) {
+      logger.warn(`[${migration.id}] interrupted; stopping`);
+      controller.abort(options.signal?.reason ?? new Error('interrupted'));
+    }
+  };
+  if (options.signal?.aborted) onInterrupt();
+  else options.signal?.addEventListener('abort', onInterrupt, { once: true });
   const timer = setInterval(() => {
     if (busy > 0 || controller.signal.aborted) return;
     void exclusive(beat);
@@ -465,6 +483,7 @@ async function runWrite(
   } finally {
     clearInterval(timer);
     clearTimeout(watchdog);
+    options.signal?.removeEventListener('abort', onInterrupt);
     ended.abort();
   }
   if (error === undefined && controller.signal.aborted) error = controller.signal.reason;

@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { mockClient } from 'aws-sdk-client-mock';
-import { createMigrateCli, type MigrateCliOptions } from './cli.js';
+import { EventEmitter } from 'node:events';
+import { createMigrateCli, handleInterrupts, type MigrateCliOptions } from './cli.js';
 import { InMemoryMigrationHistory, type HistoryRecord } from './history.js';
 import type { Logger, Migration } from './types.js';
 
@@ -131,5 +132,45 @@ describe('createMigrateCli', () => {
     const { cli, output } = setup();
     expect(await cli.run(['--help'])).toBe(0);
     expect(output()).toContain('Exit codes');
+  });
+});
+
+describe('handleInterrupts', () => {
+  const logger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
+
+  it('aborts on the first signal naming it, forces an exit on the second, and removes its handlers', () => {
+    const source = new EventEmitter();
+    const controller = new AbortController();
+    const forced: number[] = [];
+    const interrupts = handleInterrupts(controller, source, logger, (code) => forced.push(code));
+    expect(interrupts.received()).toBeUndefined();
+
+    source.emit('SIGTERM');
+    expect(controller.signal.aborted).toBe(true);
+    expect((controller.signal.reason as Error).message).toBe('interrupted by SIGTERM');
+    expect(interrupts.received()).toBe('SIGTERM');
+    expect(forced).toEqual([]);
+
+    source.emit('SIGINT');
+    expect(forced).toEqual([130]);
+
+    interrupts.dispose();
+    expect(source.listenerCount('SIGINT') + source.listenerCount('SIGTERM')).toBe(0);
+  });
+
+  it('an interrupted write run records the migration as failed and exits 1', async () => {
+    const source = new EventEmitter();
+    const controller = new AbortController();
+    handleInterrupts(controller, source, logger, () => {});
+    const history = new InMemoryMigrationHistory();
+    const { cli } = setup([], {
+      history,
+      migrations: [{
+        id: A, phase: 'pre', description: 'd',
+        run: async (ctx) => { source.emit('SIGINT'); ctx.signal.throwIfAborted(); },
+      }],
+    });
+    expect(await cli.run(['--phase', 'pre', '--write'], controller.signal)).toBe(1);
+    expect((await history.list())[0]).toMatchObject({ migrationId: A, status: 'failed', error: expect.stringContaining('interrupted by SIGINT') });
   });
 });

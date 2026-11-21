@@ -58,4 +58,4 @@ export {
   type RunResult,
   type UnregisteredRecord,
 } from './runner.js';
-export { createMigrateCli, type MigrateCli, type MigrateCliOptions } from './cli.js';
+export { createMigrateCli, handleInterrupts, type MigrateCli, type MigrateCliOptions, type SignalSource } from './cli.js';

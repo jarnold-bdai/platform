@@ -88,6 +88,10 @@ Exit codes:
 - `1`: work is pending (dry run), or there were refusals, conflicts, a failure, a claim held by another runner, or a failed check.
 - `2`: a usage error (bad flags, invalid or duplicate ids, an unresolved table name, no history table) or an AWS error (including credentials and network).
 
+### SIGINT and SIGTERM
+
+The CLI's `main()` handles both signals. On the first one it aborts the running migration (`ctx.signal`), records that attempt as `failed` with the reason `interrupted by SIGINT` (or `SIGTERM`), which releases the claim and keeps the checkpoint, so the next `--write` resumes where it stopped at once, without waiting for the lease. The migrations after it are `not-run`, and the process exits with `128 + the signal number` (130, 143). A migration should pass `ctx.signal` along, or check it between batches; `scanAndApply` does. A second signal exits immediately without recording anything; the claim then lapses with its lease and the next run takes it over. SIGKILL cannot be handled and has the same effect. Programs that call `runMigrations` themselves pass an `AbortSignal` as `signal`; `handleInterrupts` is the helper `main()` uses.
+
 A history record whose id is no longer registered (e.g. a deleted file) is reported as a warning and never fails the run.
 
 ## The history table

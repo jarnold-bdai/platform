@@ -26,8 +26,11 @@ export interface MigrateCliOptions {
 }
 
 export interface MigrateCli {
-  /** Parses `argv` (without the node and script paths), runs, and returns the exit code. Never throws. */
-  run(argv: readonly string[]): Promise<number>;
+  /**
+   * Parses `argv` (without the node and script paths), runs, and returns the exit code. Never throws.
+   * Aborting `signal` stops the run: see `RunOptions.signal`.
+   */
+  run(argv: readonly string[], signal?: AbortSignal): Promise<number>;
   /** `run(process.argv.slice(2))`, then sets `process.exitCode`. */
   main(): Promise<void>;
 }
@@ -54,6 +57,47 @@ const OPTIONS = {
   json: { type: 'string' },
   help: { type: 'boolean', short: 'h', default: false },
 } as const;
+
+/** The part of `process` that `handleInterrupts` needs. */
+export interface SignalSource {
+  on(event: NodeJS.Signals, listener: () => void): unknown;
+  off(event: NodeJS.Signals, listener: () => void): unknown;
+}
+
+/**
+ * On the first SIGINT or SIGTERM, aborts `controller` with an error naming the
+ * signal, so the runner records the running migration as `failed` (releasing
+ * its claim, keeping its checkpoint) before the process exits. A second signal
+ * calls `force` (default: exit at once, with 128 plus the signal number).
+ * Returns a function that removes the handlers, and tells which signal came.
+ */
+export function handleInterrupts(
+  controller: AbortController,
+  source: SignalSource,
+  logger: Logger,
+  force: (code: number) => void = (code) => process.exit(code),
+): { dispose(): void; received(): NodeJS.Signals | undefined } {
+  const numbers: Partial<Record<NodeJS.Signals, number>> = { SIGINT: 2, SIGTERM: 15 };
+  let first: NodeJS.Signals | undefined;
+  const handlers = (['SIGINT', 'SIGTERM'] as const).map((name) => {
+    const handler = () => {
+      if (first) {
+        logger.error(`${name} again: exiting without waiting`);
+        force(128 + (numbers[name] ?? 0));
+        return;
+      }
+      first = name;
+      logger.warn(`${name} received: stopping the running migration and recording it as failed (send it again to exit at once)`);
+      controller.abort(new Error(`interrupted by ${name}`));
+    };
+    source.on(name, handler);
+    return [name, handler] as const;
+  });
+  return {
+    dispose: () => handlers.forEach(([name, handler]) => source.off(name, handler)),
+    received: () => first,
+  };
+}
 
 export function createMigrateCli(options: MigrateCliOptions): MigrateCli {
   const logger = options.logger ?? consoleLogger;
@@ -138,7 +182,7 @@ export function createMigrateCli(options: MigrateCliOptions): MigrateCli {
     logger.info(`Exit ${result.exitCode}: ${why}`);
   };
 
-  const run = async (argv: readonly string[]): Promise<number> => {
+  const run = async (argv: readonly string[], signal?: AbortSignal): Promise<number> => {
     let values;
     try {
       values = parseArgs({ args: [...argv], options: OPTIONS, strict: true, allowPositionals: false }).values;
@@ -174,6 +218,7 @@ export function createMigrateCli(options: MigrateCliOptions): MigrateCli {
       resolveTable: options.resolveTable,
       history,
       logger,
+      ...(signal ? { signal } : {}),
       ...(options.leaseMs !== undefined ? { leaseMs: options.leaseMs } : {}),
       ...(options.heartbeatMs !== undefined ? { heartbeatMs: options.heartbeatMs } : {}),
       ...(options.now ? { now: options.now } : {}),
@@ -182,9 +227,9 @@ export function createMigrateCli(options: MigrateCliOptions): MigrateCli {
     return writeJson(values.json, result) ? result.exitCode : 2;
   };
 
-  const safeRun = async (argv: readonly string[]): Promise<number> => {
+  const safeRun = async (argv: readonly string[], signal?: AbortSignal): Promise<number> => {
     try {
-      return await run(argv);
+      return await run(argv, signal);
     } catch (error) {
       logger.error(`ERROR ${errorText(error)}`);
       return 2;
@@ -193,7 +238,15 @@ export function createMigrateCli(options: MigrateCliOptions): MigrateCli {
   return {
     run: safeRun,
     main: async () => {
-      process.exitCode = await safeRun(process.argv.slice(2));
+      const controller = new AbortController();
+      const interrupts = handleInterrupts(controller, process, logger);
+      try {
+        const code = await safeRun(process.argv.slice(2), controller.signal);
+        const signal = interrupts.received();
+        process.exitCode = signal ? 128 + (signal === 'SIGINT' ? 2 : 15) : code;
+      } finally {
+        interrupts.dispose();
+      }
     },
   };
 }

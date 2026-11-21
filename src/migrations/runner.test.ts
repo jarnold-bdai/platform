@@ -78,6 +78,41 @@ describe('runMigrations', () => {
     expect(calls).toEqual([]);
   });
 
+  it('an interrupt aborts the running migration, records it failed with its checkpoint, and skips the rest', async () => {
+    const history = new InMemoryMigrationHistory();
+    const interrupt = new AbortController();
+    const calls: string[] = [];
+    const first = migration(A, 'pre', calls, async (ctx) => {
+      await ctx.checkpoint.save('scan', { at: 7 });
+      interrupt.abort(new Error('interrupted by SIGTERM'));
+      expect(ctx.signal.aborted).toBe(true);
+      ctx.signal.throwIfAborted();
+    });
+    const result = await runMigrations(options([first, migration(B, 'pre', calls)], history, 'write', { signal: interrupt.signal }));
+    expect(result.exitCode).toBe(1);
+    expect(result.migrations.map((m) => m.status)).toEqual(['failed', 'not-run']);
+    expect(result.migrations[0]!.message).toContain('interrupted by SIGTERM');
+    expect(calls).toEqual([`${A}:write`]);
+    const [record] = await history.list();
+    expect(record).toMatchObject({ migrationId: A, status: 'failed', checkpoint: { scan: { at: 7 } } });
+    expect(record!.error).toContain('interrupted by SIGTERM');
+
+    // The claim is released: the next run takes it over at once and resumes.
+    const again = await runMigrations(options([migration(A, 'pre', calls), migration(B, 'pre', calls)], history, 'write', { runnerId: 'next' }));
+    expect(again.migrations[0]!.status).toBe('applied');
+  });
+
+  it('does not start a migration once interrupted', async () => {
+    const history = new InMemoryMigrationHistory();
+    const interrupt = new AbortController();
+    interrupt.abort(new Error('interrupted by SIGINT'));
+    const calls: string[] = [];
+    const result = await runMigrations(options([migration(A, 'pre', calls)], history, 'write', { signal: interrupt.signal }));
+    expect(result.migrations.map((m) => m.status)).toEqual(['not-run']);
+    expect(calls).toEqual([]);
+    expect(await history.list()).toEqual([]);
+  });
+
   it('a second runner is refused while the first holds the claim', async () => {
     const history = new InMemoryMigrationHistory();
     let release!: () => void;
