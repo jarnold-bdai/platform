@@ -1,8 +1,8 @@
 export * from './agentConfig.js';
 export * from './agentConfigPublishable.js';
 export * from './smsFollowUps.js';
-// The UI copy of agentConfig.ts exports these under the *Z names; comms keeps them
-// in other modules under the *Zod names. Both spellings are exported.
+// Both spellings are exported: the UI uses the *Z names, comms the *Zod names.
+// README.md here shows how comms re-exports them without a duplicate export.
 export {
   ServiceBookingStyleZod,
   ConsultationProtocolZod,

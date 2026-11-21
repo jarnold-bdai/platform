@@ -4,11 +4,7 @@
 // and the Amplify `AiConfiguration` structured DRAFT / VERSION# records. It is
 // also the publish and test payload.
 //
-// Ported from bdai-mvp-1 shared-types; this is now the single copy.
-// Everything below the "SHARED BODY" marker is identical in both files; only the
-// imports above it differ. There is no automated cross-repo check: each repo
-// has a test pinning the exact key list, so a one-sided change fails that repo's
-// test until the twin is updated too.
+// This is the single copy of the schema; comms and the UI import it from this package.
 //
 // Row metadata (Comms: businessId, slot, publishedVersionId, updatedAt; Amplify:
 // pk/sk, versionId, configType, …) is NOT part of this schema. Keys must not
@@ -32,8 +28,6 @@ import {
   BusinessLocationZ,
   DiscoveredUrlZ,
 } from './structuredTypes.js';
-
-// ======================== SHARED BODY (identical in both repos) ========================
 
 // ---------------------------------------------------------------------------
 // Content sub-schemas that are new or changed for the agent config. The
