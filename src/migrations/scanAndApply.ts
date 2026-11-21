@@ -4,6 +4,7 @@ import {
   ScanCommand,
   UpdateItemCommand,
   type AttributeValue,
+  type DynamoDBClient,
 } from '@aws-sdk/client-dynamodb';
 import type { Item, MigrationContext } from './types.js';
 
@@ -133,45 +134,107 @@ function merge<T>(kind: string, a: Record<string, T> | undefined, b: Record<stri
 const isConditionalCheckFailed = (error: unknown): boolean =>
   error instanceof Error && error.name === 'ConditionalCheckFailedException';
 
-async function applyWrite(ctx: MigrationContext, tableName: string, write: WriteOp): Promise<'written' | 'conflict'> {
+/** A validated write, ready to send. */
+type WriteCommand = (dynamo: DynamoDBClient) => Promise<unknown>;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
+ * Every `#name` and `:value` placeholder the expressions use is defined, and
+ * every defined one is used (DynamoDB rejects either mistake). Returns the
+ * maps as DynamoDB wants them: absent rather than empty.
+ */
+function checkPlaceholders(
+  expressions: readonly string[],
+  names: Record<string, string> | undefined,
+  values: Record<string, AttributeValue> | undefined,
+): { names?: Record<string, string>; values?: Record<string, AttributeValue> } {
+  const text = expressions.join(' ');
+  const check = (kind: 'name' | 'value', prefix: string, used: Set<string>, defined: Record<string, unknown> | undefined) => {
+    if (defined !== undefined && !isRecord(defined)) throw new Error(`expression attribute ${kind}s must be an object`);
+    for (const [placeholder, value] of Object.entries(defined ?? {})) {
+      if (!new RegExp(`^${prefix}[A-Za-z0-9_]+$`).test(placeholder)) {
+        throw new Error(`expression attribute ${kind} ${JSON.stringify(placeholder)} is not a ${prefix}placeholder`);
+      }
+      if (!used.has(placeholder)) throw new Error(`expression attribute ${kind} ${placeholder} is defined but not used in any expression`);
+      if (kind === 'name' ? typeof value !== 'string' || value === '' : !isRecord(value)) {
+        throw new Error(`expression attribute ${kind} ${placeholder} has no valid ${kind === 'name' ? 'attribute name' : 'AttributeValue'}`);
+      }
+    }
+    for (const placeholder of used) {
+      if (!defined || !(placeholder in defined)) throw new Error(`${placeholder} is used in an expression but has no expression attribute ${kind}`);
+    }
+  };
+  check('name', '#', new Set(text.match(/#[A-Za-z0-9_]+/g)), names);
+  check('value', ':', new Set(text.match(/:[A-Za-z0-9_]+/g)), values);
+  return {
+    ...(names && Object.keys(names).length > 0 ? { names } : {}),
+    ...(values && Object.keys(values).length > 0 ? { values } : {}),
+  };
+}
+
+/**
+ * Validates a planned write and builds its command, without sending it.
+ * Everything that can be checked without DynamoDB is checked here, so every
+ * mode (dry run, check and write) rejects a malformed write the same way.
+ */
+function buildWrite(tableName: string, write: WriteOp): WriteCommand {
+  if (!isRecord(write)) throw new Error('a planned write must be an object');
   const { condition } = write;
-  if (!condition || typeof condition.expression !== 'string' || condition.expression.trim() === '') {
+  if (!isRecord(condition) || typeof condition.expression !== 'string' || condition.expression.trim() === '') {
     throw new Error('a planned write needs a condition expression');
   }
-  let send: () => Promise<unknown>;
   if (write.kind === 'put') {
+    if (!isRecord(write.item) || Object.keys(write.item).length === 0) throw new Error('a put needs an item');
+    const { names, values } = checkPlaceholders([condition.expression], condition.names, condition.values);
     const command = new PutItemCommand({
       TableName: tableName,
       Item: write.item,
       ConditionExpression: condition.expression,
-      ExpressionAttributeNames: condition.names,
-      ExpressionAttributeValues: condition.values,
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
     });
-    send = () => ctx.dynamo.send(command);
-  } else if (write.kind === 'update') {
+    return (dynamo) => dynamo.send(command);
+  }
+  if (write.kind === 'update') {
+    if (!isRecord(write.key) || Object.keys(write.key).length === 0) throw new Error('an update needs a key');
+    if (typeof write.updateExpression !== 'string' || write.updateExpression.trim() === '') {
+      throw new Error('an update needs an update expression');
+    }
+    const { names, values } = checkPlaceholders(
+      [write.updateExpression, condition.expression],
+      merge('name', write.names, condition.names),
+      merge('value', write.values, condition.values),
+    );
     const command = new UpdateItemCommand({
       TableName: tableName,
       Key: write.key,
       UpdateExpression: write.updateExpression,
       ConditionExpression: condition.expression,
-      ExpressionAttributeNames: merge('name', write.names, condition.names),
-      ExpressionAttributeValues: merge('value', write.values, condition.values),
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
     });
-    send = () => ctx.dynamo.send(command);
-  } else if (write.kind === 'delete') {
+    return (dynamo) => dynamo.send(command);
+  }
+  if (write.kind === 'delete') {
+    if (!isRecord(write.key) || Object.keys(write.key).length === 0) throw new Error('a delete needs a key');
+    const { names, values } = checkPlaceholders([condition.expression], condition.names, condition.values);
     const command = new DeleteItemCommand({
       TableName: tableName,
       Key: write.key,
       ConditionExpression: condition.expression,
-      ExpressionAttributeNames: condition.names,
-      ExpressionAttributeValues: condition.values,
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
     });
-    send = () => ctx.dynamo.send(command);
-  } else {
-    throw new Error(`unknown write kind ${JSON.stringify((write as { kind?: unknown }).kind)}`);
+    return (dynamo) => dynamo.send(command);
   }
+  throw new Error(`unknown write kind ${JSON.stringify((write as { kind?: unknown }).kind)}`);
+}
+
+async function sendWrite(ctx: MigrationContext, send: WriteCommand): Promise<'written' | 'conflict'> {
   try {
-    await send();
+    await send(ctx.dynamo);
     return 'written';
   } catch (error) {
     if (isConditionalCheckFailed(error)) return 'conflict';
@@ -181,6 +244,10 @@ async function applyWrite(ctx: MigrationContext, tableName: string, write: Write
 
 /**
  * Scans one table page by page and calls `plan` for each item.
+ *
+ * Every planned write is validated in every mode (a condition is present,
+ * placeholders match their names and values), so a malformed write fails a
+ * dry run or check just as it would fail `write`, before anything is written.
  *
  * - `dry-run`: logs and counts what would be written or refused; writes nothing.
  * - `check`: the same; any item that would be written or refused fails the check.
@@ -249,12 +316,18 @@ export async function scanAndApply(ctx: MigrationContext, options: ScanAndApplyO
         ctx.report.refuse(`${options.table} ${label}`, result.reason);
         ctx.log.warn(`REFUSED ${options.table} ${label}: ${result.reason}`);
       } else if (result.action === 'write') {
+        let send: WriteCommand;
+        try {
+          send = buildWrite(tableName, result.write);
+        } catch (error) {
+          throw new Error(`invalid write planned for ${options.table} ${label}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+        }
         const detail = result.detail ?? result.write.kind;
         if (ctx.mode !== 'write') {
           summary.pending += 1;
           ctx.report.pending(`${options.table} ${label}`, detail);
           ctx.log.info(`would write ${options.table} ${label}: ${detail}`);
-        } else if (await applyWrite(ctx, tableName, result.write) === 'written') {
+        } else if (await sendWrite(ctx, send) === 'written') {
           summary.written += 1;
           ctx.report.count('written');
           ctx.log.info(`wrote ${options.table} ${label}: ${detail}`);

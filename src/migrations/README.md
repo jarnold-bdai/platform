@@ -76,7 +76,7 @@ The old code keeps writing while and after a `pre` migration runs, until the dep
 
 The runner takes the registered migrations of the phase that are not `applied` in the history, in id order. It stops at the first one that fails, refuses an item, hits a conflict, or is held by another runner. The later ones are listed as `not-run`.
 
-- **dry run**: runs each pending migration read-only and reports what it would write or refuse.
+- **dry run**: runs each pending migration read-only and reports what it would write or refuse. `scanAndApply` validates every planned write in every mode (a condition is present; every `#name` and `:value` placeholder is defined and every defined one is used), so a write that `--write` would reject fails the dry run and the check the same way, before anything is written.
 - **write**: claims each pending migration, runs it, and records it `applied`, or `failed` with the reason. Items that can be written are written even when other items are refused or conflict; the migration then stays unapplied, and the next `--write` retries it from its checkpoint.
 - **check**: passes only when nothing is left to do: no pending migration and nothing to write or refuse. A pending migration fails the check even if its data needs no write, because it still has to be recorded. With `--only <id>`, an applied migration is checked against the data again.
 

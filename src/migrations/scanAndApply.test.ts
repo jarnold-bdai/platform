@@ -296,6 +296,74 @@ describe('scanAndApply', () => {
     expect(thrown.migrations[0]).toMatchObject({ status: 'failed', message: 'plan threw for Things pk=k00: unexpected shape' });
   });
 
+  describe('validates every planned write in every mode', () => {
+    const condition = (item: Item) => unchangedCondition(item, ['pk']);
+    const update = (item: Item, extra: Record<string, unknown>) => ({
+      kind: 'update', key: { pk: item.pk! }, updateExpression: 'SET #f = :f',
+      names: { '#f': 'configFormat' }, values: { ':f': { S: 'legacy' } }, condition: condition(item), ...extra,
+    });
+    const cases: [string, (item: Item) => unknown, string][] = [
+      ['no condition', (item) => ({ kind: 'put', item }), 'needs a condition expression'],
+      ['a blank condition', (item) => ({ kind: 'delete', key: { pk: item.pk! }, condition: { expression: '  ' } }), 'needs a condition expression'],
+      ['a name placeholder with no name', (item) => update(item, { names: {} }), '#f is used in an expression but has no expression attribute name'],
+      ['a value placeholder with no value', (item) => update(item, { values: {} }), ':f is used in an expression but has no expression attribute value'],
+      ['an unused name', (item) => update(item, { names: { '#f': 'configFormat', '#g': 'x' } }), '#g is defined but not used'],
+      ['an unused value', (item) => update(item, { values: { ':f': { S: 'legacy' }, ':g': { S: 'x' } } }), ':g is defined but not used'],
+      ['a name without #', (item) => update(item, { names: { '#f': 'configFormat', f: 'x' } }), 'is not a #placeholder'],
+      ['a clash between update and condition', (item) => update(item, { names: { '#f': 'configFormat', '#unchanged0': 'other' }, updateExpression: 'SET #f = :f, #unchanged0 = :f' }), 'placeholder #unchanged0 is used with two different values'],
+      ['a put condition with an undefined value', (item) => ({ kind: 'put', item, condition: { expression: '#a = :a', names: { '#a': 'pk' } } }), ':a is used'],
+      ['an update with no update expression', (item) => update(item, { updateExpression: '' }), 'needs an update expression'],
+      ['an unknown kind', (item) => ({ kind: 'upsert', item, condition: condition(item) }), 'unknown write kind'],
+    ];
+    const modes: [Mode, (string | undefined)[]][] = [['dry-run', []], ['check', []], ['write', ['k00']]];
+
+    it.each(modes.flatMap(([mode, written]) => cases.map(([name, write, message]) => [mode, name, write, message, written] as const)))(
+      '%s: %s fails the migration',
+      async (mode, _name, write, message, written) => {
+        const table = new FakeTable(3);
+        table.install();
+        ddb.on(UpdateItemCommand).resolves({}).on(DeleteItemCommand).resolves({});
+        // k00 gets a valid write; k01 the malformed one.
+        const badPlan = (item: Item): PlanResult => (item.pk!.S === 'k01'
+          ? { action: 'write', write: write(item) as never }
+          : plan(item));
+        const m: Migration = {
+          id: ID, phase: 'pre', description: 'x', run: async (ctx) => { await scanAndApply(ctx, { table: 'Things', key: ['pk'], plan: badPlan }); },
+        };
+        const history = new InMemoryMigrationHistory();
+        const result = await run(history, mode, { migrations: [m] });
+        expect(result.exitCode).toBe(1);
+        expect(result.migrations[0]).toMatchObject({
+          status: 'failed',
+          message: expect.stringMatching(new RegExp(`^invalid write planned for Things pk=k01: .*${message.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`)),
+        });
+        // Nothing past the bad item is written, and nothing at all outside write mode.
+        expect(ddb.commandCalls(PutItemCommand).map((c) => c.args[0].input.Item!.pk!.S)).toEqual(written);
+        expect(ddb.commandCalls(UpdateItemCommand)).toHaveLength(0);
+        expect(ddb.commandCalls(DeleteItemCommand)).toHaveLength(0);
+        if (mode === 'write') expect(await history.get(ID)).toMatchObject({ status: 'failed' });
+        else expect(await history.list()).toEqual([]);
+      },
+    );
+
+    it('sends no empty name or value map', async () => {
+      const table = new FakeTable(1);
+      table.install();
+      const m: Migration = {
+        id: ID, phase: 'pre', description: 'x', run: async (ctx) => {
+          await scanAndApply(ctx, {
+            table: 'Things', key: ['pk'],
+            plan: (item) => ({ action: 'write', write: { kind: 'put', item, condition: { expression: 'attribute_exists(pk)', names: {}, values: {} } } }),
+          });
+        },
+      };
+      expect((await run(new InMemoryMigrationHistory(), 'write', { migrations: [m] })).exitCode).toBe(0);
+      const put = ddb.commandCalls(PutItemCommand)[0]!.args[0].input;
+      expect(put.ExpressionAttributeNames).toBeUndefined();
+      expect(put.ExpressionAttributeValues).toBeUndefined();
+    });
+  });
+
   it('absentCondition guards a create', () => {
     expect(absentCondition('pk')).toEqual({ expression: 'attribute_not_exists(#absent)', names: { '#absent': 'pk' } });
   });
