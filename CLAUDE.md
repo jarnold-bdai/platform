@@ -14,3 +14,6 @@ Private npm package `@jarnold-bdai/platform`, shared by three apps (comms, compl
 - No AWS SDK import under `src/agentConfig` (the web app imports it).
 - Relative imports use a `.js` extension (e.g. `./foo.js`) so the output works as native ESM.
 - No new runtime dependencies; dependencies are already declared in `package.json`.
+
+## Open follow-ups
+- Known gaps and deferred decisions are listed in `docs/open-followups.md`. Check it before starting related work, and add to it when you defer something.
