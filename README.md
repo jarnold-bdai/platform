@@ -6,7 +6,7 @@ Code shared by the bdai apps (comms `bdai-mvp-1`, the compliator `bdai-twilio-is
 
 There is no root entry point; import one of:
 
-- `@jarnold-bdai/platform/migrations`: the DynamoDB migration runner. The caller passes in the DynamoDB client.
+- `@jarnold-bdai/platform/migrations`: the DynamoDB migration runner. The caller passes in the DynamoDB client. See [src/migrations/README.md](src/migrations/README.md).
 - `@jarnold-bdai/platform/agentConfig`: Zod schemas stored by more than one app. Safe for the web app: it never imports the AWS SDK.
 
 Peer dependencies: `zod` ^3, `@aws-sdk/client-dynamodb` and `@aws-sdk/util-dynamodb` (v3).
