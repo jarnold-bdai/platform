@@ -41,4 +41,4 @@ npm run verify:exports   # after build: resolves both subpaths from CJS and ESM
 1. Bump `version` in `package.json` (e.g. `npm version minor --no-git-tag-version`) and merge to `main`.
 2. Tag `vX.Y.Z` on that commit and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 
-The publish workflow fails unless the tag equals the `package.json` version, then runs tests, builds and publishes.
+The publish workflow fails unless the tag equals the `package.json` version, then runs the same checks as CI (typecheck, tests, build, `verify:exports`) and publishes.
