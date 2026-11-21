@@ -280,6 +280,23 @@ function problemOutcome(report: Report, error: unknown): RunOne | undefined {
   return undefined;
 }
 
+/**
+ * write: an item still reported pending at the end was not written, so the
+ * migration is not done. It is recorded as failed (and retried by the next
+ * `--write`), never as applied.
+ */
+function pendingInWrite(report: Report): RunOne | undefined {
+  if (report.pendingCount === 0) return undefined;
+  return {
+    outcome: {
+      status: 'failed',
+      message: `${report.pendingCount} item(s) still pending after a write run: the migration reported writes it did not make, so it is not recorded as applied`,
+      report: report.snapshot(),
+    },
+    hardError: false,
+  };
+}
+
 async function runReadOnly(
   migration: Migration,
   record: HistoryRecord | undefined,
@@ -451,7 +468,7 @@ async function runWrite(
   }
   if (error === undefined && controller.signal.aborted) error = controller.signal.reason;
 
-  const problem = problemOutcome(report, error);
+  const problem = problemOutcome(report, error) ?? pendingInWrite(report);
   const status = problem ? 'failed' : 'applied';
   try {
     await history.finish(migration.id, runnerId, {

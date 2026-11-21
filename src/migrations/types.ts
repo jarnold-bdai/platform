@@ -49,8 +49,9 @@ export interface ReportCollector {
   count(name: string, by?: number): void;
   /**
    * An item that still needs a write (dry run / check). Counted as `pending`;
-   * a check with any pending item fails. Do not call it in `write` mode for
-   * an item you wrote.
+   * a check with any pending item fails. In `write` mode, call it only for an
+   * item you did not write: any pending item makes the run record the
+   * migration as failed, not applied.
    */
   pending(item: string, detail?: string): void;
   /** An item the migration will not write (bad data, ambiguous case). Stops the run. */

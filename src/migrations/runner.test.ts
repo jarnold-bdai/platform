@@ -165,6 +165,28 @@ describe('runMigrations', () => {
     }
   });
 
+  it('write: a migration that still reports pending items is recorded failed, not applied, and exits 1', async () => {
+    const history = new InMemoryMigrationHistory();
+    const calls: string[] = [];
+    let pending = true;
+    const migrations = [
+      migration(A, 'pre', calls, (ctx) => { if (pending) ctx.report.pending('pk=1', 'set x'); }),
+      migration(B, 'pre', calls),
+    ];
+    const result = await runMigrations(options(migrations, history, 'write'));
+    expect(result.exitCode).toBe(1);
+    expect(result.migrations.map((m) => m.status)).toEqual(['failed', 'not-run']);
+    expect(result.migrations[0]).toMatchObject({ message: expect.stringContaining('1 item(s) still pending after a write run'), report: { pendingCount: 1 } });
+    expect(await history.get(A)).toMatchObject({ status: 'failed', error: expect.stringContaining('still pending') });
+    expect(calls).toEqual([`${A}:write`]);
+
+    // Once it writes what it reported, the next --write records it applied.
+    pending = false;
+    const retry = await runMigrations(options(migrations, history, 'write'));
+    expect(retry.exitCode).toBe(0);
+    expect(await history.get(A)).toMatchObject({ status: 'applied', attempts: 2 });
+  });
+
   it('exits 2 for an AWS error', async () => {
     const history = new InMemoryMigrationHistory();
     const awsError = Object.assign(new Error('Requested resource not found'), { name: 'ResourceNotFoundException', $metadata: {}, $fault: 'client' });
