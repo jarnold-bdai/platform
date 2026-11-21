@@ -58,6 +58,17 @@ describe('InMemoryMigrationHistory', () => {
     expect((await history.claim(claimBy('r2', later(LEASE + 1)))).claimed).toBe(false);
   });
 
+  it('never lets a renewal shorten the lease (a late-arriving older heartbeat or checkpoint is refused)', async () => {
+    const history = new InMemoryMigrationHistory();
+    await history.claim(claimBy('r1'));
+    expect(await history.heartbeat('20261121-0930-a', 'r1', later(20), LEASE)).toBe(true);
+    expect(await history.heartbeat('20261121-0930-a', 'r1', later(10), LEASE)).toBe(false);
+    await expect(history.saveCheckpoint('20261121-0930-a', 'r1', { s: 1 }, later(10), LEASE)).rejects.toThrow(LeaseLostError);
+    expect(await history.get('20261121-0930-a')).toMatchObject({ leaseExpiresAt: later(20 + LEASE).toISOString() });
+    expect((await history.get('20261121-0930-a'))?.checkpoint).toBeUndefined();
+    expect(await history.heartbeat('20261121-0930-a', 'r1', later(20), LEASE)).toBe(true);
+  });
+
   it('re-claims a failed migration but never an applied one; applied drops the checkpoint', async () => {
     const history = new InMemoryMigrationHistory();
     await history.claim(claimBy('r1'));
@@ -138,8 +149,10 @@ describe('DynamoDbMigrationHistory', () => {
     await history.finish('20261121-0930-a', 'r1', { status: 'failed', now: T0, summary, error: 'boom' });
     await history.finish('20261121-0930-a', 'r1', { status: 'applied', now: T0, summary });
     const inputs = ddb.commandCalls(UpdateItemCommand).map((c) => c.args[0].input);
+    const held = '#runnerId = :runnerId AND #status = :running';
+    const renewable = `${held} AND (attribute_not_exists(#leaseExpiresAt) OR #leaseExpiresAt <= :leaseExpiresAt)`;
+    expect(inputs.map((input) => input.ConditionExpression)).toEqual([renewable, renewable, held, held]);
     for (const input of inputs) {
-      expect(input.ConditionExpression).toBe('#runnerId = :runnerId AND #status = :running');
       expect(input.ExpressionAttributeValues?.[':runnerId']).toEqual({ S: 'r1' });
       expectPlaceholdersMatch(input);
     }
@@ -152,6 +165,14 @@ describe('DynamoDbMigrationHistory', () => {
     expect(await history.heartbeat('20261121-0930-a', 'r1', T0, LEASE)).toBe(false);
     await expect(history.saveCheckpoint('20261121-0930-a', 'r1', {}, T0, LEASE)).rejects.toThrow(LeaseLostError);
     await expect(history.finish('20261121-0930-a', 'r1', { status: 'applied', now: T0, summary })).rejects.toThrow(LeaseLostError);
+  });
+
+  it('passes an abort signal to the heartbeat and checkpoint requests', async () => {
+    ddb.on(UpdateItemCommand).resolves({});
+    const signal = new AbortController().signal;
+    await history.heartbeat('20261121-0930-a', 'r1', T0, LEASE, signal);
+    await history.saveCheckpoint('20261121-0930-a', 'r1', {}, T0, LEASE, signal);
+    for (const call of ddb.commandCalls(UpdateItemCommand)) expect((call.args as unknown[])[1]).toMatchObject({ abortSignal: signal });
   });
 
   it('round-trips a checkpoint holding a binary scan key', async () => {

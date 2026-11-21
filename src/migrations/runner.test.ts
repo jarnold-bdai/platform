@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { InMemoryMigrationHistory, type HistoryRecord } from './history.js';
 import { runMigrations, type RunOptions } from './runner.js';
@@ -187,6 +187,7 @@ describe('runMigrations', () => {
     ['--only of the other phase', [migration(P, 'post', [])], { only: P }],
     ['a bad phase', [migration(A, 'pre', [])], { phase: 'during' }],
     ['a bad mode', [migration(A, 'pre', [])], { mode: 'apply' }],
+    ['a heartbeat too close to the lease', [migration(A, 'pre', [])], { leaseMs: 100, heartbeatMs: 95 }],
   ])('exits 2 for a usage error: %s', async (_name, migrations, extra) => {
     const history = new InMemoryMigrationHistory();
     const result = await runMigrations({ ...options(migrations as Migration[], history, 'write'), ...(extra as Partial<RunOptions>) });
@@ -252,5 +253,100 @@ describe('runMigrations', () => {
     expect(result.exitCode).toBe(1);
     expect(result.migrations[0]).toMatchObject({ status: 'failed', message: expect.stringContaining('lost the claim') });
     expect(await history.get(A)).toMatchObject({ status: 'running', runnerId: 'thief' });
+  });
+
+  describe('lease watchdog (fake timers)', () => {
+    const LEASE = 1000;
+    const BEAT = 200; // heartbeat timeout: 100; the runner stops 100 before the lease ends
+    beforeEach(() => {
+      vi.useFakeTimers({ now: T0 });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** Runs one migration that waits for its signal; returns when it aborted and the stored lease at that moment. */
+    async function runUntilAborted(history: InMemoryMigrationHistory) {
+      let abortedAt: number | undefined;
+      let storedLeaseEnd: number | undefined;
+      const m = migration(A, 'pre', [], async (ctx) => {
+        await new Promise<void>((resolve) => ctx.signal.addEventListener('abort', () => resolve(), { once: true }));
+        abortedAt = Date.now();
+        storedLeaseEnd = Date.parse((await history.get(A))!.leaseExpiresAt!);
+        ctx.signal.throwIfAborted();
+      });
+      const running = runMigrations(options([m], history, 'write', { leaseMs: LEASE, heartbeatMs: BEAT, now: () => new Date(), runnerId: 'me' }));
+      await vi.advanceTimersByTimeAsync(3 * LEASE);
+      const result = await running;
+      return { result, abortedAt: abortedAt!, storedLeaseEnd: storedLeaseEnd! };
+    }
+
+    it('stops before the lease ends when a heartbeat hangs, and keeps retrying past the hung request', async () => {
+      const history = new InMemoryMigrationHistory();
+      const signals: (AbortSignal | undefined)[] = [];
+      history.heartbeat = (_id, _runner, _now, _lease, signal) => {
+        signals.push(signal);
+        return new Promise<boolean>(() => {}); // never settles, and ignores its signal
+      };
+      const { result, abortedAt, storedLeaseEnd } = await runUntilAborted(history);
+      expect(storedLeaseEnd).toBe(T0.getTime() + LEASE);
+      expect(abortedAt).toBe(T0.getTime() + LEASE - 100);
+      expect(result.migrations[0]).toMatchObject({ status: 'failed', message: expect.stringContaining('lease ran out') });
+      expect(result.exitCode).toBe(1);
+      // Heartbeats at 200, 400, 600 and 800: each hung one was abandoned, with its request aborted.
+      expect(signals).toHaveLength(4);
+      expect(signals.every((signal) => signal?.aborted)).toBe(true);
+      expect(await history.get(A)).toMatchObject({ status: 'failed' });
+    });
+
+    it('counts a slow heartbeat from when it was sent, not from when its reply arrived', async () => {
+      const history = new InMemoryMigrationHistory();
+      const renew = history.heartbeat.bind(history);
+      let calls = 0;
+      history.heartbeat = async (id, runner, now, lease) => {
+        calls += 1;
+        if (calls > 1) throw new Error('network down');
+        const held = await renew(id, runner, now, lease); // stored at once, with the send time
+        await new Promise((resolve) => setTimeout(resolve, 90)); // the reply comes 90 ms later
+        return held;
+      };
+      const { result, abortedAt, storedLeaseEnd } = await runUntilAborted(history);
+      // Sent at 200: the stored lease ends at 1200, so the runner stops at 1100 (counting from the reply, it would be 1190).
+      expect(storedLeaseEnd).toBe(T0.getTime() + BEAT + LEASE);
+      expect(abortedAt).toBe(T0.getTime() + BEAT + LEASE - 100);
+      expect(abortedAt).toBeLessThan(storedLeaseEnd);
+      expect(result.migrations[0]!.status).toBe('failed');
+    });
+
+    it('stops before the lease ends when every heartbeat fails', async () => {
+      const history = new InMemoryMigrationHistory();
+      let calls = 0;
+      history.heartbeat = async () => {
+        calls += 1;
+        throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+      };
+      const { result, abortedAt, storedLeaseEnd } = await runUntilAborted(history);
+      expect(calls).toBe(4);
+      expect(abortedAt).toBe(T0.getTime() + LEASE - 100);
+      expect(abortedAt).toBeLessThan(storedLeaseEnd);
+      expect(result.migrations[0]).toMatchObject({ status: 'failed', message: expect.stringContaining('lease ran out') });
+    });
+
+    it('keeps running while renewals succeed, and a checkpoint save renews from its send time', async () => {
+      const history = new InMemoryMigrationHistory();
+      let aborted = false;
+      const m = migration(A, 'pre', [], async (ctx) => {
+        for (let i = 0; i < 10; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          await ctx.checkpoint.save('progress', { i });
+        }
+        aborted = ctx.signal.aborted;
+      });
+      const running = runMigrations(options([m], history, 'write', { leaseMs: LEASE, heartbeatMs: BEAT, now: () => new Date() }));
+      await vi.advanceTimersByTimeAsync(3 * LEASE);
+      const result = await running;
+      expect(aborted).toBe(false);
+      expect(result.migrations[0]!.status).toBe('applied');
+    });
   });
 });

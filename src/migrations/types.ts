@@ -70,7 +70,7 @@ export interface MigrationContext {
   readonly log: Logger;
   readonly checkpoint: CheckpointStore;
   readonly report: ReportCollector;
-  /** Aborted when this runner loses its claim on the migration; stop writing when it fires. */
+  /** Aborted when this runner has lost its claim, or could not renew it before its lease ends; stop writing when it fires. */
   readonly signal: AbortSignal;
 }
 

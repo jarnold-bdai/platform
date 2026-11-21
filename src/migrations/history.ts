@@ -70,10 +70,20 @@ export interface MigrationHistory {
   list(): Promise<HistoryRecord[]>;
   get(migrationId: string): Promise<HistoryRecord | undefined>;
   claim(request: ClaimRequest): Promise<ClaimResult>;
-  /** Renews the lease; false when the caller no longer holds the claim. */
-  heartbeat(migrationId: string, runnerId: string, now: Date, leaseMs: number): Promise<boolean>;
-  /** Stores the checkpoint and renews the lease; throws `LeaseLostError` when the caller no longer holds the claim. */
-  saveCheckpoint(migrationId: string, runnerId: string, checkpoint: Record<string, unknown>, now: Date, leaseMs: number): Promise<void>;
+  /**
+   * Renews the lease to `now + leaseMs`; false when the caller no longer holds
+   * the claim. A renewal never shortens the stored lease: one that arrives
+   * after a later renewal (e.g. an abandoned request that still reached the
+   * table) is refused. `signal` aborts the request.
+   */
+  heartbeat(migrationId: string, runnerId: string, now: Date, leaseMs: number, signal?: AbortSignal): Promise<boolean>;
+  /**
+   * Stores the checkpoint and renews the lease like `heartbeat`; throws
+   * `LeaseLostError` when the caller no longer holds the claim.
+   */
+  saveCheckpoint(
+    migrationId: string, runnerId: string, checkpoint: Record<string, unknown>, now: Date, leaseMs: number, signal?: AbortSignal,
+  ): Promise<void>;
   /** Ends the attempt; throws `LeaseLostError` when the caller no longer holds the claim. */
   finish(migrationId: string, runnerId: string, request: FinishRequest): Promise<void>;
 }
@@ -133,16 +143,26 @@ export class InMemoryMigrationHistory implements MigrationHistory {
     return record?.status === 'running' && record.runnerId === runnerId ? record : undefined;
   }
 
-  async heartbeat(migrationId: string, runnerId: string, now: Date, leaseMs: number): Promise<boolean> {
+  /** Held, and the renewal would not shorten the stored lease. */
+  private renewable(migrationId: string, runnerId: string, now: Date, leaseMs: number): HistoryRecord | undefined {
     const record = this.held(migrationId, runnerId);
+    if (!record) return undefined;
+    return record.leaseExpiresAt === undefined || record.leaseExpiresAt <= leaseEnd(now, leaseMs) ? record : undefined;
+  }
+
+  // In memory nothing can hang, so `signal` is accepted and ignored.
+  async heartbeat(migrationId: string, runnerId: string, now: Date, leaseMs: number, _signal?: AbortSignal): Promise<boolean> {
+    const record = this.renewable(migrationId, runnerId, now, leaseMs);
     if (!record) return false;
     record.heartbeatAt = now.toISOString();
     record.leaseExpiresAt = leaseEnd(now, leaseMs);
     return true;
   }
 
-  async saveCheckpoint(migrationId: string, runnerId: string, checkpoint: Record<string, unknown>, now: Date, leaseMs: number): Promise<void> {
-    const record = this.held(migrationId, runnerId);
+  async saveCheckpoint(
+    migrationId: string, runnerId: string, checkpoint: Record<string, unknown>, now: Date, leaseMs: number, _signal?: AbortSignal,
+  ): Promise<void> {
+    const record = this.renewable(migrationId, runnerId, now, leaseMs);
     if (!record) throw new LeaseLostError(`${migrationId}: this runner no longer holds the claim`);
     record.checkpoint = structuredClone(checkpoint);
     record.heartbeatAt = now.toISOString();
@@ -199,6 +219,8 @@ function namesFor(...expressions: string[]): Record<string, string> {
 }
 
 const HELD = '#runnerId = :runnerId AND #status = :running';
+/** Held, and the new lease is not earlier than the stored one, so a late-arriving renewal cannot shorten it. */
+const RENEWABLE = `${HELD} AND (attribute_not_exists(#leaseExpiresAt) OR #leaseExpiresAt <= :leaseExpiresAt)`;
 
 /** The history in one DynamoDB table that the consumer names and creates. */
 export class DynamoDbMigrationHistory implements MigrationHistory {
@@ -269,12 +291,12 @@ export class DynamoDbMigrationHistory implements MigrationHistory {
     }
   }
 
-  async heartbeat(migrationId: string, runnerId: string, now: Date, leaseMs: number): Promise<boolean> {
+  async heartbeat(migrationId: string, runnerId: string, now: Date, leaseMs: number, signal?: AbortSignal): Promise<boolean> {
     try {
       await this.updateHeld(migrationId, runnerId, 'SET #heartbeatAt = :now, #leaseExpiresAt = :leaseExpiresAt', {
         ':now': { S: now.toISOString() },
         ':leaseExpiresAt': { S: leaseEnd(now, leaseMs) },
-      });
+      }, RENEWABLE, signal);
       return true;
     } catch (error) {
       if (error instanceof LeaseLostError) return false;
@@ -282,13 +304,15 @@ export class DynamoDbMigrationHistory implements MigrationHistory {
     }
   }
 
-  async saveCheckpoint(migrationId: string, runnerId: string, checkpoint: Record<string, unknown>, now: Date, leaseMs: number): Promise<void> {
+  async saveCheckpoint(
+    migrationId: string, runnerId: string, checkpoint: Record<string, unknown>, now: Date, leaseMs: number, signal?: AbortSignal,
+  ): Promise<void> {
     await this.updateHeld(migrationId, runnerId,
       'SET #checkpoint = :checkpoint, #heartbeatAt = :now, #leaseExpiresAt = :leaseExpiresAt', {
         ':checkpoint': attr(checkpoint),
         ':now': { S: now.toISOString() },
         ':leaseExpiresAt': { S: leaseEnd(now, leaseMs) },
-      });
+      }, RENEWABLE, signal);
   }
 
   async finish(migrationId: string, runnerId: string, request: FinishRequest): Promise<void> {
@@ -307,17 +331,25 @@ export class DynamoDbMigrationHistory implements MigrationHistory {
     await this.updateHeld(migrationId, runnerId, `SET ${sets.join(', ')} REMOVE ${removes.join(', ')}`, values);
   }
 
-  /** An update conditional on `runnerId` still holding the `running` claim. */
-  private async updateHeld(migrationId: string, runnerId: string, update: string, values: Record<string, AttributeValue>): Promise<void> {
+  /** An update conditional on `runnerId` still holding the `running` claim (`HELD`, or the stricter `RENEWABLE`). */
+  private async updateHeld(
+    migrationId: string,
+    runnerId: string,
+    update: string,
+    values: Record<string, AttributeValue>,
+    condition: string = HELD,
+    signal?: AbortSignal,
+  ): Promise<void> {
     try {
-      await this.dynamo.send(new UpdateItemCommand({
+      const command = new UpdateItemCommand({
         TableName: this.tableName,
         Key: { migrationId: { S: migrationId } },
         UpdateExpression: update,
-        ConditionExpression: HELD,
-        ExpressionAttributeNames: namesFor(update, HELD),
+        ConditionExpression: condition,
+        ExpressionAttributeNames: namesFor(update, condition),
         ExpressionAttributeValues: { ...values, ':runnerId': { S: runnerId }, ':running': { S: 'running' } },
-      }));
+      });
+      await (signal ? this.dynamo.send(command, { abortSignal: signal }) : this.dynamo.send(command));
     } catch (error) {
       if (isConditionalCheckFailed(error)) throw new LeaseLostError(`${migrationId}: this runner no longer holds the claim`);
       throw error;

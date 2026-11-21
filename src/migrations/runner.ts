@@ -19,6 +19,26 @@ import {
 /** A claim not renewed for this long may be taken over by another runner. */
 export const DEFAULT_LEASE_MS = 5 * 60_000;
 
+/**
+ * A runner that cannot confirm a renewal stops this long before the stored
+ * lease ends (a tenth of the lease), leaving room for clock skew between
+ * runners and a late timer.
+ */
+const leaseMarginMs = (leaseMs: number): number => Math.max(1, Math.floor(leaseMs / 10));
+
+/** Settles like `promise`, or rejects with the signal's reason once it aborts, even if `promise` never settles. */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    promise.catch(() => undefined);
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
 export interface RunOptions {
   migrations: readonly Migration[];
   phase: Phase;
@@ -31,7 +51,7 @@ export interface RunOptions {
   logger?: Logger;
   /** Lease length of a claim; default 5 minutes. */
   leaseMs?: number;
-  /** How often the claim is renewed while a migration runs; default a fifth of the lease. */
+  /** How often the claim is renewed while a migration runs; default a fifth of the lease, and under nine tenths of it. */
   heartbeatMs?: number;
   /** The clock (for tests). */
   now?: () => Date;
@@ -152,8 +172,10 @@ export async function runMigrations(options: RunOptions): Promise<RunResult> {
     assertMode(options.mode);
     const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
     const heartbeatMs = options.heartbeatMs ?? Math.max(1, Math.floor(leaseMs / 5));
-    if (!(leaseMs > 0) || !(heartbeatMs > 0) || heartbeatMs >= leaseMs) {
-      throw new UsageError('leaseMs and heartbeatMs must be positive, with heartbeatMs < leaseMs');
+    // The runner stops a tenth of the lease early when no renewal is confirmed,
+    // so the first heartbeat has to go out before that.
+    if (!(leaseMs > 0) || !(heartbeatMs > 0) || heartbeatMs >= leaseMs - leaseMarginMs(leaseMs)) {
+      throw new UsageError('leaseMs and heartbeatMs must be positive, with heartbeatMs under nine tenths of leaseMs');
     }
     const registered = validateMigrations(options.migrations);
     const registeredIds = new Set(registered.map((m) => m.id));
@@ -295,12 +317,13 @@ async function runWrite(
   options: RunOptions & { logger: Logger; now: () => Date; leaseMs: number; heartbeatMs: number; runnerId: string },
 ): Promise<RunOne> {
   const { history, now, leaseMs, heartbeatMs, runnerId, logger } = options;
+  const claimedAt = now();
   const claim = await history.claim({
     migrationId: migration.id,
     phase: migration.phase,
     description: migration.description,
     runnerId,
-    now: now(),
+    now: claimedAt,
     leaseMs,
   });
   if (!claim.claimed) {
@@ -318,41 +341,99 @@ async function runWrite(
   }
 
   const controller = new AbortController();
+  /** Aborted when `run` returns, to drop a heartbeat still in flight. */
+  const ended = new AbortController();
   const lose = (why: string) => {
-    if (!controller.signal.aborted) {
+    if (!controller.signal.aborted && !ended.signal.aborted) {
       logger.error(`[${migration.id}] ${why}; stopping`);
       controller.abort(new LeaseLostError(`${migration.id}: ${why}`));
     }
   };
-  let renewedAt = now().getTime();
-  let beating = false;
-  const timer = setInterval(() => {
-    if (beating || controller.signal.aborted) return;
-    beating = true;
-    history.heartbeat(migration.id, runnerId, now(), leaseMs)
-      .then((held) => {
-        if (held) renewedAt = now().getTime();
-        else lose('lost the claim (another runner took it over)');
-      })
-      .catch((error: unknown) => {
+
+  // The stored lease ends `leaseMs` after the `now` sent with the last renewal
+  // the table accepted, so a renewal counts from when it was sent, not from
+  // when its reply arrived. The history never lets a renewal shorten the
+  // lease, so this end only moves later while the claim is held.
+  let leaseEnd = claimedAt.getTime() + leaseMs;
+  const renewed = (sentAt: Date) => {
+    leaseEnd = Math.max(leaseEnd, sentAt.getTime() + leaseMs);
+  };
+
+  // The lease watchdog: on its own timer, whatever the heartbeat is doing,
+  // abort `marginMs` before the stored lease can have ended.
+  const marginMs = leaseMarginMs(leaseMs);
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  const watch = () => {
+    const left = leaseEnd - marginMs - now().getTime();
+    if (left <= 0) {
+      lose('could not renew the claim before its lease ran out');
+      return;
+    }
+    watchdog = setTimeout(watch, left);
+    watchdog.unref?.();
+  };
+
+  // Renewals (heartbeats and checkpoint saves) go out one at a time, so a
+  // reply always answers the newest renewal: a refusal then means the claim
+  // was lost, not that an older renewal was overtaken by a newer one.
+  let renewing: Promise<unknown> = Promise.resolve();
+  let busy = 0;
+  const exclusive = <T>(task: () => Promise<T>): Promise<T> => {
+    busy += 1;
+    const result = renewing.then(task).finally(() => {
+      busy -= 1;
+    });
+    renewing = result.catch(() => undefined);
+    return result;
+  };
+
+  // A heartbeat not answered within half an interval is abandoned (its
+  // request aborted), so a hung request never blocks the next one.
+  const heartbeatTimeoutMs = Math.max(1, Math.floor(heartbeatMs / 2));
+  const beat = async (): Promise<void> => {
+    const sentAt = now();
+    const request = new AbortController();
+    const cancel = (reason: unknown) => () => request.abort(reason);
+    const timeout = setTimeout(cancel(new Error(`heartbeat timed out after ${heartbeatTimeoutMs} ms`)), heartbeatTimeoutMs);
+    timeout.unref?.();
+    const onLost = cancel(controller.signal.reason);
+    const onEnded = cancel(new Error('the migration ended'));
+    controller.signal.addEventListener('abort', onLost, { once: true });
+    ended.signal.addEventListener('abort', onEnded, { once: true });
+    try {
+      const held = await untilAborted(history.heartbeat(migration.id, runnerId, sentAt, leaseMs, request.signal), request.signal);
+      if (held) renewed(sentAt);
+      else lose('lost the claim (another runner took it over)');
+    } catch (error) {
+      if (!controller.signal.aborted && !ended.signal.aborted) {
         logger.warn(`[${migration.id}] heartbeat failed: ${errorText(error)}`);
-        if (now().getTime() - renewedAt >= leaseMs) lose('could not renew the claim before its lease ran out');
-      })
-      .finally(() => {
-        beating = false;
-      });
+      }
+    } finally {
+      clearTimeout(timeout);
+      controller.signal.removeEventListener('abort', onLost);
+      ended.signal.removeEventListener('abort', onEnded);
+    }
+  };
+  const timer = setInterval(() => {
+    if (busy > 0 || controller.signal.aborted) return;
+    void exclusive(beat);
   }, heartbeatMs);
   timer.unref?.();
+  watch();
 
   const slots: Record<string, unknown> = structuredClone(claim.record.checkpoint ?? {});
   const checkpoint: CheckpointStore = {
     load: async <T>(slot: string) => structuredClone(slots[slot]) as T | undefined,
-    save: async (slot, value) => {
+    save: (slot, value) => exclusive(async () => {
       controller.signal.throwIfAborted();
       slots[slot] = structuredClone(value);
-      await history.saveCheckpoint(migration.id, runnerId, slots, now(), leaseMs);
-      renewedAt = now().getTime();
-    },
+      const sentAt = now();
+      await untilAborted(
+        history.saveCheckpoint(migration.id, runnerId, slots, sentAt, leaseMs, controller.signal),
+        controller.signal,
+      );
+      renewed(sentAt);
+    }),
   };
 
   const report = new Report();
@@ -363,6 +444,8 @@ async function runWrite(
     error = caught ?? new Error('run threw an undefined value');
   } finally {
     clearInterval(timer);
+    clearTimeout(watchdog);
+    ended.abort();
   }
   if (error === undefined && controller.signal.aborted) error = controller.signal.reason;
 
