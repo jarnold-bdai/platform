@@ -42,3 +42,13 @@ npm run verify:exports   # after build: resolves both subpaths from CJS and ESM
 2. Tag `vX.Y.Z` on that commit and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 
 The publish workflow fails unless the tag equals the `package.json` version, then runs the same checks as CI (typecheck, tests, build, `verify:exports`) and publishes.
+
+### Staging builds
+
+A push to `staging` publishes `<version>-staging.<run number>` (for example `0.1.1-staging.7`) under the dist-tag `staging`. `latest` is never moved by a staging build.
+
+Consumers' staging builds install it with `npm install --no-save @jarnold-bdai/platform@staging`, while `package.json` in each app keeps an exact released version.
+
+Changes to this repo go to `staging` first and reach `main` by a later merge. A release is still a version bump on `main` plus a `v*` tag.
+
+Re-running a finished staging publish run fails because that version already exists (GitHub Packages versions cannot be overwritten). Push again to publish a new one.

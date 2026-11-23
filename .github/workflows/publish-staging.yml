@@ -1,0 +1,38 @@
+name: Publish staging
+
+on:
+  push:
+    branches: [staging]
+
+permissions:
+  contents: read
+  packages: write
+
+# Staging publishes run one at a time, in push order; a run in progress is never cancelled.
+concurrency:
+  group: publish-staging
+  cancel-in-progress: false
+
+jobs:
+  publish-staging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://npm.pkg.github.com
+          scope: '@jarnold-bdai'
+      - name: Set staging version (checkout only, nothing is committed)
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          npm version "${PKG_VERSION}-staging.${GITHUB_RUN_NUMBER}" --no-git-tag-version
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm run verify:exports
+      - run: npm publish --tag staging
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
