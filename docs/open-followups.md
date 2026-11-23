@@ -14,6 +14,10 @@ There is no way to start a failed migration over. Add a CLI flag that clears the
 
 All tests use mocks. Add an opt-in suite against DynamoDB Local, or a recorded first run against a staging table. The first staging run should exercise claim, lease renewal, take-over, release and a conditional write.
 
+## The read-only client has never run with a real `DynamoDBDocumentClient`
+
+`readOnlyDynamo` (src/migrations/readOnlyClient.ts, the middleware at `context.commandName`) is only tested with `@aws-sdk/client-dynamodb` and mocks. `@aws-sdk/lib-dynamodb` is not installed here, so it has never run against a `DynamoDBDocumentClient`. If that client's commands report a different `commandName`, reads are refused in dry run and check. The first staging run settles it: run a dry run and a `--check` with a document client.
+
 ## AWS SDK peer dependencies are not optional
 
 Add `peerDependenciesMeta` with `optional: true` for them. This needs the lockfile regenerated with registry access. No effect today.
@@ -37,3 +41,5 @@ Workspace-level: unit 1's worker found no `node` on PATH. Workers should report 
 ## Stage 2, comms: switching to the shared schema
 
 Switching is more than an import-path change; follow the recipe in src/agentConfig/README.md. Consider settling on one spelling (`...Z` or `...Zod`) once both apps import from the package.
+
+The recipe's check was a one-off in a scratch project and cannot be reproduced from this repo. Adopting the shared schema in comms is what settles it.

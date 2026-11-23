@@ -53,7 +53,7 @@ export interface RunOptions {
   logger?: Logger;
   /** Lease length of a claim; default 5 minutes. */
   leaseMs?: number;
-  /** How often the claim is renewed while a migration runs; default a fifth of the lease, and under nine tenths of it. */
+  /** How often the claim is renewed while a migration runs; default a fifth of the lease; it must be below 90% of it. */
   heartbeatMs?: number;
   /** The clock (for tests). */
   now?: () => Date;
@@ -61,9 +61,10 @@ export interface RunOptions {
   runnerId?: string;
   /**
    * Aborted to stop the run early (the CLI aborts it on SIGINT/SIGTERM). The
-   * running migration's `ctx.signal` aborts, its attempt is recorded as
-   * `failed` (which releases the claim and keeps the checkpoint, so the next
-   * `--write` resumes), and the migrations after it are not run.
+   * running migration's `ctx.signal` aborts. If it stops with an error, its
+   * attempt is recorded as `failed` (which releases the claim and keeps the
+   * checkpoint, so the next `--write` resumes). If it ignores the signal and
+   * finishes, it is recorded as it finished. The migrations after it are not run.
    */
   signal?: AbortSignal;
 }
@@ -184,7 +185,7 @@ export async function runMigrations(options: RunOptions): Promise<RunResult> {
     // The runner stops a tenth of the lease early when no renewal is confirmed,
     // so the first heartbeat has to go out before that.
     if (!(leaseMs > 0) || !(heartbeatMs > 0) || heartbeatMs >= leaseMs - leaseMarginMs(leaseMs)) {
-      throw new UsageError('leaseMs and heartbeatMs must be positive, with heartbeatMs under nine tenths of leaseMs');
+      throw new UsageError('leaseMs and heartbeatMs must be positive, with heartbeatMs below 90% of leaseMs');
     }
     const registered = validateMigrations(options.migrations);
     const registeredIds = new Set(registered.map((m) => m.id));
@@ -418,6 +419,9 @@ async function runWrite(
   // A heartbeat not answered within half an interval is abandoned (its
   // request aborted), so a hung request never blocks the next one.
   const heartbeatTimeoutMs = Math.max(1, Math.floor(heartbeatMs / 2));
+  // A checkpoint save gets half the lease: long enough for a large write, and
+  // short enough that the heartbeats resume before the watchdog fires.
+  const saveTimeoutMs = Math.max(1, Math.floor(leaseMs / 2));
   const beat = async (): Promise<void> => {
     const sentAt = now();
     const request = new AbortController();
@@ -466,10 +470,26 @@ async function runWrite(
       controller.signal.throwIfAborted();
       slots[slot] = structuredClone(value);
       const sentAt = now();
-      await untilAborted(
-        history.saveCheckpoint(migration.id, runnerId, slots, sentAt, leaseMs, controller.signal),
-        controller.signal,
+      // A save not answered in time is abandoned (its request aborted) and
+      // fails like any other failed save, so a hung one cannot block the
+      // heartbeats until the watchdog fires.
+      const request = new AbortController();
+      const onAbort = () => request.abort(controller.signal.reason);
+      controller.signal.addEventListener('abort', onAbort, { once: true });
+      const timeout = setTimeout(
+        () => request.abort(new Error(`checkpoint save timed out after ${saveTimeoutMs} ms`)),
+        saveTimeoutMs,
       );
+      timeout.unref?.();
+      try {
+        await untilAborted(
+          history.saveCheckpoint(migration.id, runnerId, slots, sentAt, leaseMs, request.signal),
+          request.signal,
+        );
+      } finally {
+        clearTimeout(timeout);
+        controller.signal.removeEventListener('abort', onAbort);
+      }
       renewed(sentAt);
     }),
   };
@@ -486,7 +506,10 @@ async function runWrite(
     options.signal?.removeEventListener('abort', onInterrupt);
     ended.abort();
   }
-  if (error === undefined && controller.signal.aborted) error = controller.signal.reason;
+  // A lost lease fails the attempt even if `run` returned. An interrupt does
+  // not: a migration that ignored `ctx.signal` and finished is recorded as
+  // finished (or failed, by its report), not as "interrupted".
+  if (error === undefined && controller.signal.reason instanceof LeaseLostError) error = controller.signal.reason;
 
   const problem = problemOutcome(report, error) ?? pendingInWrite(report);
   const status = problem ? 'failed' : 'applied';

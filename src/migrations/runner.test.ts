@@ -102,6 +102,16 @@ describe('runMigrations', () => {
     expect(again.migrations[0]!.status).toBe('applied');
   });
 
+  it('records a migration that ignores an interrupt and finishes as applied, not as interrupted', async () => {
+    const history = new InMemoryMigrationHistory();
+    const interrupt = new AbortController();
+    const calls: string[] = [];
+    const m = migration(A, 'pre', calls, async () => { interrupt.abort(new Error('interrupted by SIGINT')); });
+    const result = await runMigrations(options([m, migration(B, 'pre', calls)], history, 'write', { signal: interrupt.signal }));
+    expect(result.migrations.map((x) => x.status)).toEqual(['applied', 'not-run']);
+    expect((await history.get(A))?.status).toBe('applied');
+  });
+
   it('does not start a migration once interrupted', async () => {
     const history = new InMemoryMigrationHistory();
     const interrupt = new AbortController();
@@ -373,6 +383,21 @@ describe('runMigrations', () => {
       expect(abortedAt).toBe(T0.getTime() + BEAT + LEASE - 100);
       expect(abortedAt).toBeLessThan(storedLeaseEnd);
       expect(result.migrations[0]!.status).toBe('failed');
+    });
+
+    it('fails a checkpoint save that hangs, so the heartbeats resume', async () => {
+      const history = new InMemoryMigrationHistory();
+      history.saveCheckpoint = (_id, _runner, _cp, _now, _lease, signal) =>
+        new Promise<void>((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason)));
+      let saveError: unknown;
+      const m = migration(A, 'pre', [], async (ctx) => {
+        await ctx.checkpoint.save('s', { i: 1 }).catch((e) => { saveError = e; });
+      });
+      const running = runMigrations(options([m], history, 'write', { leaseMs: LEASE, heartbeatMs: BEAT, now: () => new Date() }));
+      await vi.advanceTimersByTimeAsync(LEASE);
+      const result = await running;
+      expect(String(saveError)).toContain('checkpoint save timed out');
+      expect(result.migrations[0]!.status).toBe('applied');
     });
 
     it('stops before the lease ends when every heartbeat fails', async () => {
