@@ -176,7 +176,7 @@ describe('handleInterrupts', () => {
 });
 
 describe('main', () => {
-  const run = async (code: number | undefined, migrationBody: Migration['run'], signalName: NodeJS.Signals | undefined) => {
+  const run = async (migrationBody: Migration['run'], signalName: NodeJS.Signals | undefined) => {
     const saved = { argv: process.argv, exitCode: process.exitCode };
     const before = { int: process.listenerCount('SIGINT'), term: process.listenerCount('SIGTERM') };
     process.argv = ['node', 'migrate', '--phase', 'pre', '--write'];
@@ -196,15 +196,15 @@ describe('main', () => {
   };
 
   it('exits with the run result when a signal arrives but the run finishes cleanly', async () => {
-    expect(await run(0, async () => {}, 'SIGTERM')).toBe(0);
+    expect(await run(async () => {}, 'SIGTERM')).toBe(0);
   });
 
   it('exits 128 plus the signal number when the interrupted run did not finish', async () => {
-    expect(await run(1, async (ctx) => ctx.signal.throwIfAborted(), 'SIGINT')).toBe(130);
-    expect(await run(1, async (ctx) => ctx.signal.throwIfAborted(), 'SIGTERM')).toBe(143);
+    expect(await run(async (ctx) => ctx.signal.throwIfAborted(), 'SIGINT')).toBe(130);
+    expect(await run(async (ctx) => ctx.signal.throwIfAborted(), 'SIGTERM')).toBe(143);
   });
 
   it('exits with the run result when no signal arrives', async () => {
-    expect(await run(0, async () => {}, undefined)).toBe(0);
+    expect(await run(async () => {}, undefined)).toBe(0);
   });
 });
