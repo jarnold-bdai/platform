@@ -1,6 +1,6 @@
 {
   "name": "@jarnold-bdai/platform",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Code shared by the bdai apps: DynamoDB migration runner and shared Zod schemas",
   "license": "UNLICENSED",
   "repository": {
