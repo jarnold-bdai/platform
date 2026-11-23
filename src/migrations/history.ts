@@ -99,6 +99,24 @@ function claimable(record: HistoryRecord | undefined, now: Date): boolean {
   return record === undefined || record.status === 'failed' || isStale(record, now);
 }
 
+/**
+ * Remembers the latest time sent for each claim, so a clock that steps
+ * backwards cannot send a renewal whose lease is earlier than the stored one:
+ * `RENEWABLE` would refuse it, and the runner would report a lost claim that
+ * was never lost.
+ */
+class SentClock {
+  private readonly latest = new Map<string, number>();
+
+  /** `max(now, the previous time sent)` for this claim, and remembers it. */
+  next(migrationId: string, runnerId: string, now: Date): Date {
+    const key = `${migrationId}\u0000${runnerId}`;
+    const at = Math.max(now.getTime(), this.latest.get(key) ?? Number.NEGATIVE_INFINITY);
+    this.latest.set(key, at);
+    return at === now.getTime() ? now : new Date(at);
+  }
+}
+
 /** For tests and local experiments: the same rules as the DynamoDB history, in memory. */
 export class InMemoryMigrationHistory implements MigrationHistory {
   private readonly records = new Map<string, HistoryRecord>();
@@ -226,6 +244,7 @@ const RENEWABLE = `${HELD} AND (attribute_not_exists(#leaseExpiresAt) OR #leaseE
 export class DynamoDbMigrationHistory implements MigrationHistory {
   private readonly dynamo: DynamoDBClient;
   private readonly tableName: string;
+  private readonly sent = new SentClock();
 
   constructor(options: DynamoDbMigrationHistoryOptions) {
     this.dynamo = options.dynamo;
@@ -257,6 +276,7 @@ export class DynamoDbMigrationHistory implements MigrationHistory {
   }
 
   async claim(request: ClaimRequest): Promise<ClaimResult> {
+    this.sent.next(request.migrationId, request.runnerId, request.now);
     const now = request.now.toISOString();
     const update = 'SET #status = :running, #phase = :phase, #description = :description, #startedAt = :now, '
       + '#heartbeatAt = :now, #leaseExpiresAt = :leaseExpiresAt, #runnerId = :runnerId, '
@@ -291,7 +311,8 @@ export class DynamoDbMigrationHistory implements MigrationHistory {
     }
   }
 
-  async heartbeat(migrationId: string, runnerId: string, now: Date, leaseMs: number, signal?: AbortSignal): Promise<boolean> {
+  async heartbeat(migrationId: string, runnerId: string, sentAt: Date, leaseMs: number, signal?: AbortSignal): Promise<boolean> {
+    const now = this.sent.next(migrationId, runnerId, sentAt);
     try {
       await this.updateHeld(migrationId, runnerId, 'SET #heartbeatAt = :now, #leaseExpiresAt = :leaseExpiresAt', {
         ':now': { S: now.toISOString() },
@@ -305,8 +326,9 @@ export class DynamoDbMigrationHistory implements MigrationHistory {
   }
 
   async saveCheckpoint(
-    migrationId: string, runnerId: string, checkpoint: Record<string, unknown>, now: Date, leaseMs: number, signal?: AbortSignal,
+    migrationId: string, runnerId: string, checkpoint: Record<string, unknown>, sentAt: Date, leaseMs: number, signal?: AbortSignal,
   ): Promise<void> {
+    const now = this.sent.next(migrationId, runnerId, sentAt);
     await this.updateHeld(migrationId, runnerId,
       'SET #checkpoint = :checkpoint, #heartbeatAt = :now, #leaseExpiresAt = :leaseExpiresAt', {
         ':checkpoint': attr(checkpoint),

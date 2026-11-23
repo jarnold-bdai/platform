@@ -272,6 +272,28 @@ describe('scanAndApply', () => {
     expect(clashed.migrations[0]).toMatchObject({ status: 'failed', message: expect.stringContaining('#unchanged0') });
   });
 
+  it('accepts an update whose write.names and condition.names are disjoint', async () => {
+    const table = new FakeTable(1);
+    table.install();
+    const m: Migration = {
+      id: ID, phase: 'pre', description: 'x', run: async (ctx) => {
+        await scanAndApply(ctx, {
+          table: 'Things', key: ['pk'],
+          plan: (item) => ({ action: 'write', write: {
+            kind: 'update', key: { pk: item.pk! }, updateExpression: 'SET #f = :f',
+            names: { '#f': 'configFormat' }, values: { ':f': { S: 'new' } },
+            condition: { expression: '#g = :g', names: { '#g': 'legacyFormat' }, values: { ':g': { S: 'old' } } },
+          } }),
+        });
+      },
+    };
+    const result = await run(new InMemoryMigrationHistory(), 'write', { migrations: [m] });
+    expect(result.migrations[0]!.status).toBe('applied');
+    const input = ddb.commandCalls(UpdateItemCommand)[0]!.args[0].input;
+    expect(input.ExpressionAttributeNames).toEqual({ '#f': 'configFormat', '#g': 'legacyFormat' });
+    expect(input.ExpressionAttributeValues).toEqual({ ':f': { S: 'new' }, ':g': { S: 'old' } });
+  });
+
   it('fails the migration when a planned write has no condition, or the plan throws', async () => {
     const table = new FakeTable(1);
     table.install();
