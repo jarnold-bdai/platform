@@ -17,10 +17,10 @@ Add to the consumer's `.npmrc` (committed; it holds no secret):
 
 ```
 @jarnold-bdai:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=${NPM_TOKEN}
+//npm.pkg.github.com/:_authToken=${GITHUB_PACKAGES_TOKEN}
 ```
 
-Export `NPM_TOKEN` as a GitHub token with `read:packages` (in CI, `GITHUB_TOKEN` with `packages: read`). Never commit the token. Then:
+Export `GITHUB_PACKAGES_TOKEN` as a GitHub token with `read:packages` (in CI, `GITHUB_TOKEN` with `packages: read`). Never commit the token. Then:
 
 ```
 npm install @jarnold-bdai/platform

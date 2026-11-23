@@ -47,7 +47,7 @@ Nothing else changes: `src/index.ts`, every `./agentConfig` / `./fieldDefinition
 
 Keep `agentConfig.ts` and `smsFollowUps.ts` as one-line files rather than deleting them. Other comms packages import them by path: `thirdPartyIntegrationTools/*` and `bookingPlatformAdapters/*` import `@bdai/shared-types/agentConfig` and `@bdai/shared-types/smsFollowUps`, through their tsconfig `paths`, and in Lambda through the compiled layer. `agentConfigPublishable.ts` has no such importer. You may delete it and the line `export * from "./agentConfigPublishable";` in `src/index.ts` instead; both work.
 
-How this was checked: in a scratch project, against the packed package (`npm pack` of this repo), with comms' `layers/shared-types/tsconfig.json` (CommonJS, `moduleResolution: node`, which resolves the subpath through `typesVersions`):
+How this was checked (a one-off in a scratch project that cannot be reproduced from this repo; it is settled for good when comms adopts the shared schema in stage 2): in a scratch project, against the packed package (`npm pack` of this repo), with comms' `layers/shared-types/tsconfig.json` (CommonJS, `moduleResolution: node`, which resolves the subpath through `typesVersions`):
 
 - `tsc` accepts `src/` with these changes, with no TS2308. Without the `fieldDefinitions.ts` change it reports TS2308 for the three enums. Without the `cancelOrRescheduleProtocol.ts` change it reports TS2308 for `CancelOrRescheduleProtocolZod` and `CancelOrRescheduleProtocol`.
 - `tests/` type-checks with the same errors as before the change and no new ones.

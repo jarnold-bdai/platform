@@ -243,7 +243,9 @@ export function createMigrateCli(options: MigrateCliOptions): MigrateCli {
       try {
         const code = await safeRun(process.argv.slice(2), controller.signal);
         const signal = interrupts.received();
-        process.exitCode = signal ? 128 + (signal === 'SIGINT' ? 2 : 15) : code;
+        // A run that finished cleanly keeps its own result; any other result
+        // after a signal is the conventional 128 + signal number.
+        process.exitCode = signal && code !== 0 ? 128 + (signal === 'SIGINT' ? 2 : 15) : code;
       } finally {
         interrupts.dispose();
       }

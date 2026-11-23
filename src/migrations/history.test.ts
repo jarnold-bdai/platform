@@ -167,6 +167,17 @@ describe('DynamoDbMigrationHistory', () => {
     await expect(history.finish('20261121-0930-a', 'r1', { status: 'applied', now: T0, summary })).rejects.toThrow(LeaseLostError);
   });
 
+  it('sends max(now, the previous time sent), so a clock stepping backwards does not look like a lost claim', async () => {
+    ddb.on(UpdateItemCommand).resolves({});
+    await history.heartbeat('20261121-0930-a', 'r1', later(1000), LEASE);
+    await history.heartbeat('20261121-0930-a', 'r1', later(500), LEASE);
+    await history.saveCheckpoint('20261121-0930-a', 'r1', {}, later(200), LEASE);
+    const [, beat, save] = ddb.commandCalls(UpdateItemCommand).map((c) => c.args[0].input);
+    for (const input of [beat!, save!]) {
+      expect(input.ExpressionAttributeValues?.[':leaseExpiresAt']).toEqual({ S: later(1000 + LEASE).toISOString() });
+    }
+  });
+
   it('passes an abort signal to the heartbeat and checkpoint requests', async () => {
     ddb.on(UpdateItemCommand).resolves({});
     const signal = new AbortController().signal;

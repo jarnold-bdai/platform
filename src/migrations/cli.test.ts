@@ -174,3 +174,37 @@ describe('handleInterrupts', () => {
     expect((await history.list())[0]).toMatchObject({ migrationId: A, status: 'failed', error: expect.stringContaining('interrupted by SIGINT') });
   });
 });
+
+describe('main', () => {
+  const run = async (migrationBody: Migration['run'], signalName: NodeJS.Signals | undefined) => {
+    const saved = { argv: process.argv, exitCode: process.exitCode };
+    const before = { int: process.listenerCount('SIGINT'), term: process.listenerCount('SIGTERM') };
+    process.argv = ['node', 'migrate', '--phase', 'pre', '--write'];
+    try {
+      const { cli } = setup([], { migrations: [{ id: A, phase: 'pre', description: 'd', run: async (ctx) => {
+        if (signalName) process.emit(signalName);
+        await migrationBody(ctx);
+      } }] });
+      await cli.main();
+      expect(process.listenerCount('SIGINT')).toBe(before.int);
+      expect(process.listenerCount('SIGTERM')).toBe(before.term);
+      return process.exitCode;
+    } finally {
+      process.argv = saved.argv;
+      process.exitCode = saved.exitCode;
+    }
+  };
+
+  it('exits with the run result when a signal arrives but the run finishes cleanly', async () => {
+    expect(await run(async () => {}, 'SIGTERM')).toBe(0);
+  });
+
+  it('exits 128 plus the signal number when the interrupted run did not finish', async () => {
+    expect(await run(async (ctx) => ctx.signal.throwIfAborted(), 'SIGINT')).toBe(130);
+    expect(await run(async (ctx) => ctx.signal.throwIfAborted(), 'SIGTERM')).toBe(143);
+  });
+
+  it('exits with the run result when no signal arrives', async () => {
+    expect(await run(async () => {}, undefined)).toBe(0);
+  });
+});

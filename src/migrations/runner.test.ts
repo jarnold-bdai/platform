@@ -102,6 +102,16 @@ describe('runMigrations', () => {
     expect(again.migrations[0]!.status).toBe('applied');
   });
 
+  it('records a migration that ignores an interrupt and finishes as applied, not as interrupted', async () => {
+    const history = new InMemoryMigrationHistory();
+    const interrupt = new AbortController();
+    const calls: string[] = [];
+    const m = migration(A, 'pre', calls, async () => { interrupt.abort(new Error('interrupted by SIGINT')); });
+    const result = await runMigrations(options([m, migration(B, 'pre', calls)], history, 'write', { signal: interrupt.signal }));
+    expect(result.migrations.map((x) => x.status)).toEqual(['applied', 'not-run']);
+    expect((await history.get(A))?.status).toBe('applied');
+  });
+
   it('does not start a migration once interrupted', async () => {
     const history = new InMemoryMigrationHistory();
     const interrupt = new AbortController();
@@ -373,6 +383,70 @@ describe('runMigrations', () => {
       expect(abortedAt).toBe(T0.getTime() + BEAT + LEASE - 100);
       expect(abortedAt).toBeLessThan(storedLeaseEnd);
       expect(result.migrations[0]!.status).toBe('failed');
+    });
+
+    it('fails a checkpoint save that hangs, so the heartbeats resume', async () => {
+      const history = new InMemoryMigrationHistory();
+      history.saveCheckpoint = (_id, _runner, _cp, _now, _lease, signal) =>
+        new Promise<void>((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason)));
+      const renew = history.heartbeat.bind(history);
+      const beats: number[] = [];
+      history.heartbeat = (id, runner, now, lease, signal) => {
+        beats.push(Date.now());
+        return renew(id, runner, now, lease, signal);
+      };
+      let saveError: unknown;
+      let failedAt = 0;
+      const m = migration(A, 'pre', [], async (ctx) => {
+        await ctx.checkpoint.save('s', { i: 1 }).catch((e) => { saveError = e; failedAt = Date.now(); });
+        await new Promise((resolve) => setTimeout(resolve, 2 * BEAT));
+      });
+      const running = runMigrations(options([m], history, 'write', { leaseMs: LEASE, heartbeatMs: BEAT, now: () => new Date() }));
+      await vi.advanceTimersByTimeAsync(LEASE);
+      const result = await running;
+      expect(String(saveError)).toContain('checkpoint save timed out');
+      expect(failedAt).toBe(T0.getTime() + LEASE / 2);
+      // The heartbeats at 200 and 400 were skipped while the save was in flight; those at 600 and 800 went out.
+      expect(beats).toEqual([T0.getTime() + 3 * BEAT, T0.getTime() + 4 * BEAT]);
+      expect(result.migrations[0]!.status).toBe('applied');
+    });
+
+    it('keeps renewing the lease for a migration that ignores an interrupt and runs past it', async () => {
+      const history = new InMemoryMigrationHistory();
+      const interrupt = new AbortController();
+      let signalAborted = false;
+      const m = migration(A, 'pre', [], async (ctx) => {
+        interrupt.abort(new Error('interrupted by SIGINT'));
+        signalAborted = ctx.signal.aborted;
+        await new Promise((resolve) => setTimeout(resolve, 3 * LEASE));
+        // Still held: the last heartbeat (at 2800) renewed the lease past now.
+        expect(Date.parse((await history.get(A))!.leaseExpiresAt!)).toBeGreaterThan(Date.now());
+      });
+      const running = runMigrations(options([m, migration(B, 'pre', [])], history, 'write', {
+        leaseMs: LEASE, heartbeatMs: BEAT, now: () => new Date(), runnerId: 'me', signal: interrupt.signal,
+      }));
+      await vi.advanceTimersByTimeAsync(4 * LEASE);
+      const result = await running;
+      expect(signalAborted).toBe(true);
+      expect(result.migrations.map((r) => r.status)).toEqual(['applied', 'not-run']);
+      expect(await history.get(A)).toMatchObject({ status: 'applied', runnerId: 'me' });
+    });
+
+    it('still fails a migration that ignores an interrupt and then loses its lease', async () => {
+      const history = new InMemoryMigrationHistory();
+      const interrupt = new AbortController();
+      const m = migration(A, 'pre', [], async () => {
+        interrupt.abort(new Error('interrupted by SIGINT'));
+        history.heartbeat = async () => false; // another runner took the claim over
+        await new Promise((resolve) => setTimeout(resolve, LEASE));
+      });
+      const running = runMigrations(options([m], history, 'write', {
+        leaseMs: LEASE, heartbeatMs: BEAT, now: () => new Date(), runnerId: 'me', signal: interrupt.signal,
+      }));
+      await vi.advanceTimersByTimeAsync(2 * LEASE);
+      const result = await running;
+      expect(result.migrations[0]).toMatchObject({ status: 'failed', message: expect.stringContaining('lost the claim') });
+      expect(result.exitCode).toBe(1);
     });
 
     it('stops before the lease ends when every heartbeat fails', async () => {

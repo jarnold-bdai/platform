@@ -53,7 +53,7 @@ export interface RunOptions {
   logger?: Logger;
   /** Lease length of a claim; default 5 minutes. */
   leaseMs?: number;
-  /** How often the claim is renewed while a migration runs; default a fifth of the lease, and under nine tenths of it. */
+  /** How often the claim is renewed while a migration runs; default a fifth of the lease; it must be below 90% of it. */
   heartbeatMs?: number;
   /** The clock (for tests). */
   now?: () => Date;
@@ -61,9 +61,12 @@ export interface RunOptions {
   runnerId?: string;
   /**
    * Aborted to stop the run early (the CLI aborts it on SIGINT/SIGTERM). The
-   * running migration's `ctx.signal` aborts, its attempt is recorded as
-   * `failed` (which releases the claim and keeps the checkpoint, so the next
-   * `--write` resumes), and the migrations after it are not run.
+   * running migration's `ctx.signal` aborts. If it stops with an error, its
+   * attempt is recorded as `failed` (which releases the claim and keeps the
+   * checkpoint, so the next `--write` resumes). If it ignores the signal and
+   * finishes, it is recorded as it finished. The claim stays renewed (and a
+   * lost lease still fails it) until it returns. The migrations after it are
+   * not run.
    */
   signal?: AbortSignal;
 }
@@ -184,7 +187,7 @@ export async function runMigrations(options: RunOptions): Promise<RunResult> {
     // The runner stops a tenth of the lease early when no renewal is confirmed,
     // so the first heartbeat has to go out before that.
     if (!(leaseMs > 0) || !(heartbeatMs > 0) || heartbeatMs >= leaseMs - leaseMarginMs(leaseMs)) {
-      throw new UsageError('leaseMs and heartbeatMs must be positive, with heartbeatMs under nine tenths of leaseMs');
+      throw new UsageError('leaseMs and heartbeatMs must be positive, with heartbeatMs below 90% of leaseMs');
     }
     const registered = validateMigrations(options.migrations);
     const registeredIds = new Set(registered.map((m) => m.id));
@@ -368,13 +371,23 @@ async function runWrite(
       + (claim.record.checkpoint ? ', resuming from its checkpoint' : ''));
   }
 
+  /** The migration's `ctx.signal`: aborted on a lost lease or an interrupt. */
   const controller = new AbortController();
+  /**
+   * Aborted only when the lease is lost. The heartbeats, the watchdog and
+   * checkpoint saves follow this one, not `controller`, so they keep the
+   * lease renewed (and lease loss detected) after an interrupt, while a
+   * migration that ignores `ctx.signal` is still running.
+   */
+  const lost = new AbortController();
   /** Aborted when `run` returns, to drop a heartbeat still in flight. */
   const ended = new AbortController();
   const lose = (why: string) => {
-    if (!controller.signal.aborted && !ended.signal.aborted) {
+    if (!lost.signal.aborted && !ended.signal.aborted) {
       logger.error(`[${migration.id}] ${why}; stopping`);
-      controller.abort(new LeaseLostError(`${migration.id}: ${why}`));
+      const reason = new LeaseLostError(`${migration.id}: ${why}`);
+      lost.abort(reason);
+      if (!controller.signal.aborted) controller.abort(reason);
     }
   };
 
@@ -418,32 +431,41 @@ async function runWrite(
   // A heartbeat not answered within half an interval is abandoned (its
   // request aborted), so a hung request never blocks the next one.
   const heartbeatTimeoutMs = Math.max(1, Math.floor(heartbeatMs / 2));
+  // A checkpoint save gets half the lease: long enough for a large write.
+  // Heartbeats wait while a save is in flight, so whether they resume before
+  // the watchdog fires depends on heartbeatMs: the first heartbeat after a
+  // timed-out save goes out up to one interval later, so with heartbeatMs
+  // roughly leaseMs / 3 or more the watchdog can fire first and the attempt
+  // fails as lease lost.
+  const saveTimeoutMs = Math.max(1, Math.floor(leaseMs / 2));
   const beat = async (): Promise<void> => {
     const sentAt = now();
     const request = new AbortController();
     const cancel = (reason: unknown) => () => request.abort(reason);
     const timeout = setTimeout(cancel(new Error(`heartbeat timed out after ${heartbeatTimeoutMs} ms`)), heartbeatTimeoutMs);
     timeout.unref?.();
-    const onLost = cancel(controller.signal.reason);
+    const onLost = () => request.abort(lost.signal.reason);
     const onEnded = cancel(new Error('the migration ended'));
-    controller.signal.addEventListener('abort', onLost, { once: true });
+    lost.signal.addEventListener('abort', onLost, { once: true });
     ended.signal.addEventListener('abort', onEnded, { once: true });
     try {
       const held = await untilAborted(history.heartbeat(migration.id, runnerId, sentAt, leaseMs, request.signal), request.signal);
       if (held) renewed(sentAt);
       else lose('lost the claim (another runner took it over)');
     } catch (error) {
-      if (!controller.signal.aborted && !ended.signal.aborted) {
+      if (!lost.signal.aborted && !ended.signal.aborted) {
         logger.warn(`[${migration.id}] heartbeat failed: ${errorText(error)}`);
       }
     } finally {
       clearTimeout(timeout);
-      controller.signal.removeEventListener('abort', onLost);
+      lost.signal.removeEventListener('abort', onLost);
       ended.signal.removeEventListener('abort', onEnded);
     }
   };
-  // An outside stop request (SIGINT/SIGTERM) aborts the migration like a lost
-  // lease does; the attempt then ends as `failed`, which releases the claim.
+  // An outside stop request (SIGINT/SIGTERM) aborts `ctx.signal` only. If the
+  // migration then stops with an error, the attempt ends as `failed`, which
+  // releases the claim. The heartbeats and the watchdog carry on until `run`
+  // returns, so a migration that ignores the signal keeps its lease renewed.
   const onInterrupt = () => {
     if (!controller.signal.aborted && !ended.signal.aborted) {
       logger.warn(`[${migration.id}] interrupted; stopping`);
@@ -453,7 +475,7 @@ async function runWrite(
   if (options.signal?.aborted) onInterrupt();
   else options.signal?.addEventListener('abort', onInterrupt, { once: true });
   const timer = setInterval(() => {
-    if (busy > 0 || controller.signal.aborted) return;
+    if (busy > 0 || lost.signal.aborted) return;
     void exclusive(beat);
   }, heartbeatMs);
   timer.unref?.();
@@ -463,13 +485,29 @@ async function runWrite(
   const checkpoint: CheckpointStore = {
     load: async <T>(slot: string) => structuredClone(slots[slot]) as T | undefined,
     save: (slot, value) => exclusive(async () => {
-      controller.signal.throwIfAborted();
+      lost.signal.throwIfAborted();
       slots[slot] = structuredClone(value);
       const sentAt = now();
-      await untilAborted(
-        history.saveCheckpoint(migration.id, runnerId, slots, sentAt, leaseMs, controller.signal),
-        controller.signal,
+      // A save not answered in time is abandoned (its request aborted) and
+      // fails like any other failed save, so a hung one cannot block the
+      // heartbeats until the watchdog fires.
+      const request = new AbortController();
+      const onAbort = () => request.abort(lost.signal.reason);
+      lost.signal.addEventListener('abort', onAbort, { once: true });
+      const timeout = setTimeout(
+        () => request.abort(new Error(`checkpoint save timed out after ${saveTimeoutMs} ms`)),
+        saveTimeoutMs,
       );
+      timeout.unref?.();
+      try {
+        await untilAborted(
+          history.saveCheckpoint(migration.id, runnerId, slots, sentAt, leaseMs, request.signal),
+          request.signal,
+        );
+      } finally {
+        clearTimeout(timeout);
+        lost.signal.removeEventListener('abort', onAbort);
+      }
       renewed(sentAt);
     }),
   };
@@ -486,7 +524,10 @@ async function runWrite(
     options.signal?.removeEventListener('abort', onInterrupt);
     ended.abort();
   }
-  if (error === undefined && controller.signal.aborted) error = controller.signal.reason;
+  // A lost lease fails the attempt even if `run` returned. An interrupt does
+  // not: a migration that ignored `ctx.signal` and finished is recorded as
+  // finished (or failed, by its report), not as "interrupted".
+  if (error === undefined && lost.signal.aborted) error = lost.signal.reason;
 
   const problem = problemOutcome(report, error) ?? pendingInWrite(report);
   const status = problem ? 'failed' : 'applied';
